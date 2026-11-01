@@ -9,6 +9,7 @@
 | 文件 | 职责 |
 | --- | --- |
 | src/bridge.mjs | 登录、运行循环、磁盘保存、进程锁与健康状态 |
+| src/supervisor.mjs | 登录启动、T3 就绪检查、进程接管与退出重试 |
 | src/api.mjs | 微信协议、请求超时及消息 ID 精度 |
 | src/core.mjs | 命令解析、收件去重、恢复及回复格式 |
 | src/command-policy.mjs | 指定目标、引用和排队策略的唯一来源 |

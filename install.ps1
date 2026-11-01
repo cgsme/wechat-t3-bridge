@@ -24,13 +24,14 @@ Copy-Item -LiteralPath (Join-Path $sourcePath 'node_modules') -Destination $runt
 Copy-Item -LiteralPath (Join-Path $sourcePath 'package.json') -Destination $runtimePath -Force
 Copy-Item -LiteralPath (Join-Path $sourcePath 'README.md') -Destination $runtimePath -Force
 $configValue = @{
-  threadId = $ThreadId; cwd = $sourcePath; command = $t3Executable; prefixArgs = @($t3Entry)
+  threadId = $ThreadId; cwd = $sourcePath; command = $t3Executable; desktopCommand = $t3Executable; prefixArgs = @($t3Entry)
   env = @{ ELECTRON_RUN_AS_NODE = '1'; T3CODE_DESKTOP_CLI_LAUNCHER = '1'; T3CODE_HOME = (Join-Path $env:USERPROFILE '.t3') }
 }
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 [IO.File]::WriteAllText((Join-Path $dataPath 'config.json'), ($configValue | ConvertTo-Json -Depth 5), $utf8)
 $entryPath = Join-Path $runtimePath 'src\bridge.mjs'
-$commandLine = '"' + $nodePath + '" "' + $entryPath + '" run'
+$supervisorPath = Join-Path $runtimePath 'src\supervisor.mjs'
+$commandLine = '"' + $nodePath + '" "' + $supervisorPath + '"'
 $vbs = 'Set bridgeShell = CreateObject("WScript.Shell")' + "`r`n" +
   'bridgeShell.Environment("PROCESS")("WECHAT_T3_DATA") = "' + $dataPath.Replace('"', '""') + '"' + "`r`n" +
   'bridgeShell.Run "' + $commandLine.Replace('"', '""') + '", 0, False' + "`r`n"
@@ -39,7 +40,7 @@ $startPath = Join-Path $runtimePath 'Start.vbs'
 $startupPath = Join-Path ([Environment]::GetFolderPath('Startup')) 'WeChatT3Bridge.vbs'
 Copy-Item -LiteralPath $startPath -Destination $startupPath -Force
 [IO.File]::WriteAllText((Join-Path $runtimePath 'installation.json'), (@{
-  node = $nodePath; entry = $entryPath; data = $dataPath; startup = $startupPath; source = $sourcePath
+  node = $nodePath; entry = $entryPath; supervisor = $supervisorPath; data = $dataPath; startup = $startupPath; source = $sourcePath
 } | ConvertTo-Json), $utf8)
 Write-Output "Installed: $runtimePath"
 Write-Output 'Startup enabled. The bridge will accept only the WeChat account that scans the login QR.'

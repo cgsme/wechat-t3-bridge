@@ -21,6 +21,8 @@ function Get-BridgeProcess {
 $restartBegan = $false
 $nextProcess = $null
 $backupPath = $null
+$supervisorPausePath = Join-Path $dataPath 'supervisor-pause.json'
+$supervisorPaused = $false
 try {
   $targetVersion = (Get-Content -LiteralPath (Join-Path $PSScriptRoot 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json).version
   $installed = Get-Content -LiteralPath (Join-Path $runtimePath 'installation.json') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -59,6 +61,9 @@ for (const number of [1, 2, 10, 30]) {
   if (-not $ready) { throw 'Timed out waiting for the current WeChat reply; the running bridge was kept.' }
 
   # Recheck the executable, creation time, lock and inbox immediately before stopping.
+  # Keep the startup supervisor from relaunching files while they are replaced.
+  [IO.File]::WriteAllText($supervisorPausePath, (@{ pid = $PID } | ConvertTo-Json), $utf8)
+  $supervisorPaused = $true
   $currentProcess = Get-BridgeProcess
   if ($currentProcess.CreationDate -ne $initialProcess.CreationDate) { throw 'Bridge process identity changed.' }
   $oldLock = Get-Content -LiteralPath (Join-Path $dataPath 'bridge.lock') -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -107,4 +112,9 @@ for (const number of [1, 2, 10, 30]) {
     } catch { Set-UpgradeStatus 'error' ($upgradeError + ' Rollback also failed: ' + $_.Exception.Message) }
   } else { Set-UpgradeStatus 'error' $upgradeError }
   exit 1
+} finally {
+  if ($supervisorPaused -and (Test-Path -LiteralPath $supervisorPausePath)) {
+    $pauseOwner = Get-Content -LiteralPath $supervisorPausePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($pauseOwner.pid -eq $PID) { Remove-Item -LiteralPath $supervisorPausePath -Force }
+  }
 }

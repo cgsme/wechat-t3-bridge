@@ -20,6 +20,14 @@
 
 从微信发起桥接自身的更新时，`upgrade.ps1` 可以先暂存代码，等指定消息已回复、收件箱为空时再备份旧版、重启和检查微信轮询。它核对进程路径、创建时间与锁文件，只重启对应的桥接进程，保留微信凭据和消息状态。
 
+升级替换文件前会写入 `data\supervisor-pause.json`，守护在升级或回滚结束前暂停拉起桥接；该记录只有所有者进程仍在运行时才生效。
+
+## 启动与自动恢复
+
+当前用户登录 Windows 后，守护检查 T3 连接。桌面端未运行时自动启动，连接失败按 5、10、20、30 秒的间隔持续重试；已有桥接会被接管，桥接退出后重新启动。它只管理程序进程，不重发消息或重新执行任务。用户未登录、系统休眠或网络不可用时不保证微信即时响应；绑定失效需要重新扫码。
+
+`data\supervisor-status.json` 的 `phase` 为 `waiting_for_t3` 时表示等待 T3，`starting_bridge` 为启动桥接，`running` 为桥接进程已运行，`maintenance` 为升级暂停，`retrying` 为进程操作失败后等待重试。`data\status.json` 继续记录微信连接；守护拉起桥接的输出保存在 `data\supervisor-bridge.log`。
+
 ## 停用
 
-删除 Windows 启动文件夹内的 `WeChatT3Bridge.vbs` 可以关闭自动启动。运行中的桥接 PID 位于 `data\bridge.lock`；结束进程前先确认其命令行指向本程序。微信中解除 ClawBot 绑定可撤销微信端连接。
+删除 Windows 启动文件夹内的 `WeChatT3Bridge.vbs` 可以关闭下次登录时的自动启动。要立即停用，先结束 `data\supervisor.lock` 指向的守护，再结束 `data\bridge.lock` 指向的桥接；结束前分别确认命令行指向本安装的 `supervisor.mjs`、`bridge.mjs`，否则守护会自动拉起桥接。微信中解除 ClawBot 绑定可撤销微信端连接。
