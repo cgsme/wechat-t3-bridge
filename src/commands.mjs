@@ -7,6 +7,7 @@ import { catalogThreads, describeThread } from './thread-labels.mjs';
 import { usageWindow, formatCost, formatToken, formatLimits } from './usage.mjs';
 import { listSkills, skillPrompt } from './skills.mjs';
 import { supportsTarget } from './command-policy.mjs';
+import { activeTaskStatuses, waitForJob } from './task-tracking.mjs';
 
 export function validateThread(thread, projectId) {
   if (!thread?.threadId || thread.projectId !== projectId || thread.archived || thread.relationshipToParent === 'subagent') {
@@ -69,6 +70,12 @@ export async function executeCommand({ command, state, config, reference, backen
   };
   const available = async () => (await backend.list(config, routing.projectId))
     .filter(thread => thread.projectId === routing.projectId && !thread.archived && thread.relationshipToParent !== 'subagent');
+
+  if (job.waitOnly && job.runId && job.threadId) {
+    const selected = { ...(job.createdThread || job.replyThread), threadId: job.threadId, projectId: job.projectId || targetProjectId };
+    const result = await waitForJob({ state, job, thread: selected, config, backend, save });
+    return typeof result === 'string' ? result : rememberQuestion(state, selected, result, save, job.replyTo || command.text);
+  }
 
   switch (command.kind) {
     case 'skills': {
@@ -309,6 +316,7 @@ export async function executeCommand({ command, state, config, reference, backen
         throw new Error(`T3 已返回新线程 ${shortThreadId(result.threadId, Object.keys(state.threadCatalog || {}))}，但尚未完成创建确认，当前选中线程未改变。\n请用 /threads 核对，不要重复发送 /new。\n${error.message}`);
       }
       job.createdThread = threadInfo(created);
+      job.waitOnly = !!job.runId;
       if (routing.projectId !== project.id) {
         if (routing.threadId) {
           routing.projectThreads[routing.projectId] = routing.threadId;
@@ -337,6 +345,16 @@ export async function executeCommand({ command, state, config, reference, backen
       job.threadId = selected.threadId;
       save();
       const target = { ...config, threadId: selected.threadId };
+      if (state.untrackedRuns?.[selected.threadId] && command.kind !== 'answer' && !state.pendingInputs?.[selected.threadId]) {
+        if (activeTaskStatuses.has(selected.status) || selected.status === 'waiting' || selected.pendingRequestCount > 0) {
+          return '上条任务的跟踪已中断，当前任务仍在运行或等待确认；本条任务未提交。请先用 /status、/history 或 /questions 核对，或用 /stop 停止原任务。';
+        }
+        if (!['completed', 'failed', 'cancelled', 'interrupted', 'rolled_back', 'idle'].includes(selected.status)) {
+          return '上条任务状态仍未确认，本条任务未提交。请先在 T3 核对原任务。';
+        }
+        delete state.untrackedRuns[selected.threadId];
+        save();
+      }
       const draft = state.pendingInputs?.[selected.threadId];
       if (draft && job.receivedAt && draft.openedAt && job.receivedAt <= draft.openedAt) {
         return `当前线程有待答问题，本条消息未作为答案或新任务提交。请用 /answer 回答，或用 /new 创建其他任务。\n\n${formatQuestion(selected, draft, state)}`;
@@ -350,8 +368,24 @@ export async function executeCommand({ command, state, config, reference, backen
         if (request) return rememberQuestion(state, selected, { request, runId: selected.latestRunId }, save);
         return 'T3 正等待确认，请在桌面端查看；本条消息未作为新任务发送。';
       }
-      const result = await backend.send(target, skillPrompt(command, config));
+      let result;
+      const prompt = skillPrompt(command, config);
+      try { result = await backend.send(target, prompt); }
+      catch (error) {
+        if (error.code !== 'T3_WAIT_ABORTED') {
+          state.untrackedRuns ||= {};
+          state.untrackedRuns[selected.threadId] = { projectId: selected.projectId };
+          save();
+        }
+        throw error;
+      }
       if (result?.runId) { job.runId = result.runId; save(); }
+      if (activeTaskStatuses.has(result?.status)) {
+        if (!result.runId) throw new Error('T3 未返回任务编号，请在桌面端核对；不会自动重跑。');
+        job.waitOnly = true;
+        save();
+        result = await waitForJob({ state, job, thread: selected, config, backend, save });
+      }
       if (typeof result?.reply === 'string' && result.status !== 'waiting') return result.reply;
       return typeof result === 'string' ? result : rememberQuestion(state, selected, result, save, job.replyTo || command.text);
     }

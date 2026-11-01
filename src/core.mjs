@@ -44,7 +44,9 @@ export const HELP = commandManual([
   '/skills [关键词]',
   '  查询本机技能；也可用 /技能。',
   '/task --skill <名称[,名称]> <要求>',
-  '  指定技能执行任务；--skills 与 --skill 等价，放在正文之前，也支持 /new --skills <名称> [--name <标题>] <要求>。',
+  '  指定技能执行任务；--skills 与 --skill 等价，可省略 /task；技能名称和任务正文均必填。',
+  '  /new 的 --skill、--name、--project 可任意排序，均放在正文之前；支持 --skill=名称。',
+  '  正文以 --skills 开头时，用 -- 分隔，如 /task -- --skills 是正文。',
   '',
   '/help [en]',
   '  显示微信 → T3 中文帮助；/help en 显示英文帮助。',
@@ -54,6 +56,7 @@ export const HELP = commandManual([
   '',
   '/task <要求>',
   '  在当前线程执行任务；也可直接发送正文，省略 /task。',
+  '  长任务持续跟踪；T3 退出或持续失联会提示。桥接重启后只恢复已确认任务的查询，不重新提交。',
   '',
   '/steer <补充指令>',
   '  立即向正在运行的任务补充指令；也可用 /task --steer <内容>。',
@@ -170,7 +173,9 @@ export const HELP_EN = commandManual([
   '/skills [search]',
   '  List or search local skills.',
   '/task --skill <name[,name]> <request>',
-  '  Use named local skills. --skills is an alias of --skill. Also supports /new --skills <name> [--name <title>] <request>.',
+  '  Use named local skills. --skills is an alias of --skill; /task is optional. Skill names and a request are required.',
+  '  For /new, put --skill, --name and --project in any order before the request. --skill=name also works.',
+  '  Use -- before a literal request starting with --skills, for example /task -- --skills is literal text.',
   '',
   '/help [en]',
   '  Show Chinese help; /help en shows this English manual.',
@@ -179,6 +184,7 @@ export const HELP_EN = commandManual([
   '',
   '/task <request>',
   '  Run a task in the selected thread. Plain text works without /task.',
+  '  Long tasks remain tracked. T3 exit or prolonged disconnection is reported. A bridge restart only resumes confirmed task reads.',
   '',
   '/steer <instruction>',
   '  Immediately update a running task; /task --steer <instruction> also works.',
@@ -288,15 +294,20 @@ export const HELP_EN = commandManual([
   '  Example: answer option 1 in thread 2 from your last /threads list.',
 ]);
 
-function newRequest(input) {
-  const flags = /^(--name|--title|--名称|--名字|-n|--project|--项目|-p)(?=$|[\s=])/i;
-  if (!flags.test(input)) return null;
-  const error = message => ({ kind: 'error', text: `${message}\n用法：/new --name "线程名称" <任务内容>\n项目：/new --project <项目> [--name "线程名称"] <任务内容>\n中文：/新建 [--项目 <项目>] [--名称 "线程名称"] <任务内容>` });
-  const result = { kind: 'new' };
+function taskRequest(input, kind) {
+  const flags = kind === 'new'
+    ? /^(--skills?|--name|--title|--名称|--名字|-n|--project|--项目|-p)(?=$|[\s=])/i
+    : /^--skills?(?=$|[\s=])/i;
+  if (!flags.test(input) && !/^--(?:\s|$)/.test(input)) return null;
+  const error = message => ({ kind: 'error', text: message + (kind === 'new'
+    ? '\n用法：/new --name "线程名称" <任务内容>\n项目：/new --project <项目> [--name "线程名称"] <任务内容>\n中文：/新建 [--项目 <项目>] [--名称 "线程名称"] <任务内容>\n技能：/new [--project <项目>] [--name "线程名称"] --skill <名称[,名称]> <任务内容>'
+    : '\n用法：/task --skill <名称[,名称]> <任务内容>\n--skills 与 --skill 等价，可省略 /task；多个技能用英文逗号分隔。') });
+  const result = { kind };
   let rest = input;
   for (let option; (option = rest.match(flags));) {
-    const field = /^(--project|--项目|-p)$/i.test(option[0]) ? 'projectSelector' : 'title';
-    const label = field === 'title' ? '线程名称' : '项目';
+    const field = /^--skills?$/i.test(option[0]) ? 'skills'
+      : /^(--project|--项目|-p)$/i.test(option[0]) ? 'projectSelector' : 'title';
+    const label = { skills: '技能名称', title: '线程名称', projectSelector: '项目' }[field];
     if (Object.hasOwn(result, field)) return error(`${label}参数不能重复。`);
     rest = rest.slice(option[0].length).trimStart();
     if (rest.startsWith('=')) rest = rest.slice(1).trimStart();
@@ -314,13 +325,23 @@ function newRequest(input) {
       rest = rest.slice(value.length);
     }
     if (!value || /[\u0000-\u001f\u007f]/.test(value)) return error(`${label}不能为空，且必须为单行文字。`);
-    result[field] = field === 'projectSelector' && value === '初始' ? 'home' : value;
+    if (field === 'skills') {
+      const names = value.split(',').map(name => name.trim());
+      if (names.some(name => !name || /\s/.test(name) || name.startsWith('-'))) {
+        return error('请提供有效的技能名称；多个技能用英文逗号分隔，名称不能为空或包含空白。');
+      }
+      result.skills = [...new Set(names)];
+    } else {
+      result[field] = field === 'projectSelector' && value === '初始' ? 'home' : value;
+    }
     rest = rest.trimStart();
   }
   // Once the body starts, keep every subsequent byte of its contents, including flags.
   if (/^--(?:\s|$)/.test(rest)) rest = rest.slice(2).trimStart();
   if (!rest) return error('参数后还需要提供任务内容。');
-  return { ...result, text: rest };
+  const control = routeControl(normalizeCommand(rest));
+  if (control && result.skills) return error('--skill 仅用于任务正文。');
+  return control || { ...result, text: rest };
 }
 
 function routeControl(input) {
@@ -354,17 +375,12 @@ function routeControl(input) {
 
 export function route(text) {
   const input = normalizeCommand(text.trim());
-  const skilled = input.match(/^\/(task|new)\s+--skills?\s+(\S+)\s+([\s\S]+)$/i);
-  if (skilled) {
-    const request = route(`/${skilled[1]} ${skilled[3]}`);
-    if (!['task', 'new'].includes(request.kind)) return { kind: 'error', text: '--skill 仅用于任务正文。' };
-    return { ...request, skills: [...new Set(skilled[2].split(',').filter(Boolean))] };
-  }
   const direct = input.match(/^\/to[ \t\u3000]+(初始|#\d+|[\w:-]+)\s+([\s\S]+)$/i);
   if (direct) {
     const requestText = normalizeCommand(direct[2]);
     if (/^\/to\b/i.test(requestText)) return { kind: 'help' };
     const request = route(requestText);
+    if (request.kind === 'error') return request;
     // Target tasks, questions and Fast controls without changing global routing.
     if (request.selector || !supportsTarget(request.kind)) return { kind: 'help' };
     return { ...request, selector: direct[1] === '初始' ? 'home' : direct[1] };
@@ -381,16 +397,14 @@ export function route(text) {
       const text = request.replace(/^--steer\s*/i, '');
       return text ? { kind: 'steer', text } : { kind: 'help' };
     }
-    if (task[1].toLowerCase() === 'new') {
-      const options = newRequest(request);
-      if (options) return options.kind === 'error' ? options : routeControl(normalizeCommand(options.text)) || options;
-    }
+    const options = taskRequest(request, task[1].toLowerCase());
+    if (options) return options;
     // Keep bridge controls out of AI prompts: an AI-generated thread list does
     // not update the saved numbering used by /switch.
     return routeControl(normalizeCommand(request)) || { kind: task[1].toLowerCase(), text: request };
   }
   if (input.startsWith('/')) return { kind: 'help' };
-  return { kind: 'task', text: input };
+  return taskRequest(input, 'task') || { kind: 'task', text: input };
 }
 
 export function incoming(message, owner) {
@@ -498,6 +512,16 @@ export function recover(state) {
     // Existing inboxes may still contain the former plain-text command kind.
     if (job.command?.kind === 'chat') job.command.kind = 'task';
     if (job.status !== 'running') continue;
+    if (job.waitOnly && job.runId && job.threadId && (job.command?.kind !== 'new' || job.createdThread)) {
+      // Only resume observing a confirmed submission. Never submit the command again.
+      job.status = 'pending';
+      job.bound = true;
+      continue;
+    }
+    if (job.threadId && ['task', 'new', 'answer'].includes(job.command?.kind)) {
+      state.untrackedRuns ||= {};
+      state.untrackedRuns[job.threadId] = { runId: job.runId, projectId: job.projectId };
+    }
     job.status = 'reply';
     const thread = job.createdThread;
     const identity = thread || job.replyThread;

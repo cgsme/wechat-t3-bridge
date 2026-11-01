@@ -4,8 +4,9 @@ import os from 'node:os';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
 import { callT3, parseCliJson } from './backend.mjs';
 import { fastMode, fastSelection } from './models.mjs';
+import { abortedWait, activeTaskStatuses, endedTaskStatuses, trackingError } from './task-tracking.mjs';
 
-const ALLOWED_TOOLS = new Set(['orchestrator_capabilities', 't3_thread_configure', 't3_pending_request', 't3_project_list', 't3_project_read', 't3_thread_send', 't3_thread_organize', 't3_thread_interrupt', 't3_thread_read']);
+const ALLOWED_TOOLS = new Set(['orchestrator_capabilities', 't3_thread_configure', 't3_pending_request', 't3_project_list', 't3_project_read', 't3_thread_send', 't3_thread_organize', 't3_thread_interrupt', 't3_thread_read', 't3_thread_wait']);
 
 export function localMcpEndpoint(origin) {
   const url = new URL(origin);
@@ -31,6 +32,7 @@ export function decodeRpc(text, requestId) {
 // Full-access thread writes use T3's own MCP authorization flow, as the T3 CLI does.
 // A CLI-issued one-time pairing credential authorizes this local integration.
 export async function issueWriteCredential(config, origin, cli, fetchImpl) {
+  const cleanupConfig = { ...config, signal: undefined };
   const label = `WeChat model control ${randomUUID()}`;
   const paired = parseCliJson(await cli(config, ['auth', 'pairing', 'create',
     '--scope', 'orchestration:read', '--scope', 'orchestration:operate',
@@ -47,10 +49,10 @@ export async function issueWriteCredential(config, origin, cli, fetchImpl) {
   };
   const revoke = async () => {
     // T3 OAuth returns an access token but no session ID; locate the unique label.
-    const sessions = parseCliJson(await cli(config, ['auth', 'session', 'list', '--json'], { timeout: 20000, acceptCodes: [0] }));
+    const sessions = parseCliJson(await cli(cleanupConfig, ['auth', 'session', 'list', '--json'], { timeout: 20000, acceptCodes: [0] }));
     if (!Array.isArray(sessions)) throw new Error('T3 session cleanup failed.');
     for (const session of sessions.filter(item => item.client?.label === label)) {
-      await cli(config, ['auth', 'session', 'revoke', session.sessionId], { timeout: 20000, acceptCodes: [0] });
+      await cli(cleanupConfig, ['auth', 'session', 'revoke', session.sessionId], { timeout: 20000, acceptCodes: [0] });
     }
   };
   try {
@@ -75,7 +77,7 @@ export async function issueWriteCredential(config, origin, cli, fetchImpl) {
     await revoke();
     throw error;
   } finally {
-    await cli(config, ['auth', 'pairing', 'revoke', paired.id], { timeout: 20000, acceptCodes: [0] });
+    await cli(cleanupConfig, ['auth', 'pairing', 'revoke', paired.id], { timeout: 20000, acceptCodes: [0] });
   }
 }
 
@@ -86,7 +88,13 @@ export async function withT3Control(config, action, {
     return JSON.parse(fs.readFileSync(path.join(root, 'userdata', 'server-runtime.json'), 'utf8'));
   },
 } = {}) {
-  const endpoint = localMcpEndpoint(readRuntime().origin);
+  let runtime;
+  try { runtime = readRuntime(); }
+  catch (error) {
+    if (error.code === 'ENOENT') throw trackingError('T3_CONNECTION_LOST', 'T3 连接暂不可用。');
+    throw trackingError('T3_INVALID_RUNTIME', 'T3 本机连接配置无法读取，请检查桌面端。');
+  }
+  const endpoint = localMcpEndpoint(runtime.origin);
   const issued = write ? await issueWriteCredential(config, new URL(endpoint).origin, cli, fetchImpl) : parseCliJson(await cli(config, ['auth', 'session', 'issue', '--subject', 'mcp-client',
     '--scope', 'orchestration:read',
     '--ttl', '2m', '--label', 'WeChat T3 model control', '--json'], { timeout: 20000, acceptCodes: [0] }));
@@ -99,13 +107,26 @@ export async function withT3Control(config, action, {
     ...(sessionId ? { 'Mcp-Session-Id': sessionId } : {}) });
   const rpc = async (method, params, notification = false) => {
     const id = notification ? undefined : ++sequence;
-    const response = await fetchImpl(endpoint, { method: 'POST', headers: headers(),
-      body: JSON.stringify({ jsonrpc: '2.0', ...(notification ? {} : { id }), method, ...(params ? { params } : {}) }),
-      signal: AbortSignal.timeout(30000), redirect: 'error' });
+    let response, text;
+    try {
+      response = await fetchImpl(endpoint, { method: 'POST', headers: headers(),
+        body: JSON.stringify({ jsonrpc: '2.0', ...(notification ? {} : { id }), method, ...(params ? { params } : {}) }),
+        signal: config.signal ? AbortSignal.any([config.signal, AbortSignal.timeout(30000)]) : AbortSignal.timeout(30000), redirect: 'error' });
+      if (!response.ok) {
+        await response.body?.cancel();
+        throw trackingError([408, 429, 502, 503, 504].includes(response.status) ? 'T3_CONNECTION_LOST' : 'T3_CONTROL_REJECTED',
+          `T3 control HTTP ${response.status}.`);
+      }
+      text = await response.text();
+    } catch (error) {
+      if (config.signal?.aborted) throw abortedWait();
+      if (error instanceof TypeError || ['TimeoutError', 'AbortError'].includes(error.name)) {
+        throw trackingError('T3_CONNECTION_LOST', 'T3 连接中断或请求超时。');
+      }
+      throw error;
+    }
     const nextSession = response.headers.get('mcp-session-id');
     if (nextSession) sessionId = nextSession;
-    if (!response.ok) { await response.body?.cancel(); throw new Error(`T3 control HTTP ${response.status}.`); }
-    const text = await response.text();
     return notification ? undefined : decodeRpc(text, id);
   };
   try {
@@ -115,6 +136,9 @@ export async function withT3Control(config, action, {
     await rpc('notifications/initialized', undefined, true);
     return await action(async (tool, args) => {
       if (!ALLOWED_TOOLS.has(tool)) throw new Error('Unsupported T3 model control tool.');
+      if (tool === 't3_thread_wait' && (!args.threadId || !args.runId || args.timeoutMs !== 1)) {
+        throw new Error('Waiting requires an explicit thread, run and a bounded read.');
+      }
       if (tool === 't3_thread_interrupt' && (!write || !args.threadId)) throw new Error('Interrupting requires a write credential and an explicit target.');
       if (tool === 't3_thread_organize' && (!write || !['settle', 'unsettle'].includes(args.action) || !args.threadId)) {
         throw new Error('Settling requires a write credential and an explicit target; only settle/unsettle are supported.');
@@ -130,12 +154,74 @@ export async function withT3Control(config, action, {
       try { await fetchImpl(endpoint, { method: 'DELETE', headers: headers(), signal: AbortSignal.timeout(5000), redirect: 'error' }); } catch {}
     }
     if (write) await issued.revoke();
-    else await cli(config, ['auth', 'session', 'revoke', issued.sessionId], { timeout: 20000, acceptCodes: [0] });
+    else await cli({ ...config, signal: undefined }, ['auth', 'session', 'revoke', issued.sessionId], { timeout: 20000, acceptCodes: [0] });
   }
 }
 
 export function readModelConfig(config) {
   return withT3Control(config, call => call('t3_thread_configure', { threadId: config.threadId }));
+}
+
+// T3's exact-run wait follows restart continuations and does not confuse a
+// desktop client's newer turn with this task, including while this task queues.
+export async function readTaskState(config, runId, { control = withT3Control } = {}) {
+  const parentSignal = config.signal;
+  const budget = AbortSignal.timeout(config.trackingTimeoutMs || 45000);
+  config = { ...config, signal: parentSignal ? AbortSignal.any([parentSignal, budget]) : budget };
+  try { return await control(config, async call => {
+    const invalid = () => trackingError('T3_INVALID_TASK', 'T3 任务状态或结果校验失败，请在桌面端核对；不会自动重跑。');
+    const waited = await call('t3_thread_wait', { threadId: config.threadId, runId, timeoutMs: 1, untilDelegatedWorkSettled: true });
+    if (waited.threadId !== config.threadId || !waited.runId || typeof waited.timedOut !== 'boolean' ||
+      !activeTaskStatuses.has(waited.status) && !endedTaskStatuses.has(waited.status) && waited.status !== 'waiting') throw invalid();
+    if (waited.resultRun && (!waited.resultRun.runId || !endedTaskStatuses.has(waited.resultRun.status))) throw invalid();
+    const result = { threadId: config.threadId, runId: waited.resultRun?.runId || waited.runId,
+      status: waited.resultRun?.status || waited.status };
+    const snapshot = await call('t3_thread_read', { threadId: config.threadId, limit: 1, runLimit: 1 });
+    const thread = snapshot.thread;
+    if (thread?.threadId !== config.threadId || thread.archived ||
+      config.expectedProjectId && thread.projectId !== config.expectedProjectId) throw invalid();
+    const current = (thread.activeRunId || thread.latestRunId) === result.runId;
+    if (current && (waited.status === 'waiting' || waited.timedOut && thread.pendingRequestCount > 0)) {
+      const request = await readPendingRequest(config, { control: (_, action) => action(call) });
+      return { ...result, status: 'waiting', request };
+    }
+    if (waited.status === 'waiting') return { ...result, request: null };
+    if (waited.timedOut) return { ...result, status: 'running' };
+    if (!endedTaskStatuses.has(waited.status)) throw invalid();
+    const type = result.status === 'completed' ? 'assistant_message' : 'error';
+    let item, afterPosition;
+    do {
+      const page = await call('t3_thread_read', { threadId: config.threadId,
+        view: type === 'error' ? 'activity' : 'messages', limit: 100, runLimit: 1, maxCharsPerItem: 50000,
+        ...(afterPosition === undefined ? {} : { afterPosition }) });
+      if (page.thread?.threadId !== config.threadId || !Array.isArray(page.items) || typeof page.hasMore !== 'boolean') throw invalid();
+      item = page.items.filter(entry => entry.runId === result.runId && entry.type === type).at(-1) || item;
+      if (!page.hasMore) break;
+      if (!Number.isSafeInteger(page.nextPosition) || page.nextPosition < 0 ||
+        afterPosition !== undefined && page.nextPosition <= afterPosition) throw invalid();
+      afterPosition = page.nextPosition;
+    } while (true);
+    let text = item?.text || '', offset = item?.nextTextOffset;
+    if (typeof text !== 'string') throw invalid();
+    if (Buffer.byteLength(text) > 2 * 1024 * 1024) throw trackingError('T3_OUTPUT_TOO_LARGE', 'T3 回复过长，请在桌面端查看结果。');
+    let truncated = item?.textTruncated;
+    while (truncated) {
+      if (!Number.isSafeInteger(offset) || offset < 0) throw invalid();
+      const page = await call('t3_thread_read', { threadId: config.threadId, itemId: item.itemId,
+        textOffset: offset, runLimit: 1, maxCharsPerItem: 50000 });
+      const chunk = page.items?.find(entry => entry.itemId === item.itemId && entry.runId === result.runId);
+      if (page.thread?.threadId !== config.threadId || !chunk || chunk.textTruncated && chunk.nextTextOffset <= offset) throw invalid();
+      text += chunk.text || '';
+      offset = chunk.nextTextOffset;
+      truncated = chunk.textTruncated;
+      if (Buffer.byteLength(text) > 2 * 1024 * 1024) throw trackingError('T3_OUTPUT_TOO_LARGE', 'T3 回复过长，请在桌面端查看结果。');
+    }
+    return { ...result, [type === 'error' ? 'error' : 'reply']: text };
+  }); } catch (error) {
+    if (parentSignal?.aborted) throw abortedWait();
+    if (budget.aborted) throw trackingError('T3_CONNECTION_LOST', 'T3 状态查询超时，正在核对连接。');
+    throw error;
+  }
 }
 
 export function readProjects(config, { control = withT3Control } = {}) {

@@ -295,6 +295,6 @@ test('failed first runs still return their thread id and stdin safely through th
   assert.equal(result.threadId, 'created-thread');
   assert.equal(result.status, 'failed');
   assert.equal(result.input, prompt);
-  assert.deepEqual(result.args, ['thread', 'start', '--wait', '--json', '--provider', 'codex',
+  assert.deepEqual(result.args, ['thread', 'start', '--json', '--provider', 'codex',
     '--model', 'existing-model', '--title', 'WeChat: task', 'project', '-']);
 });

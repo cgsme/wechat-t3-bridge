@@ -203,12 +203,12 @@ test('a persisted receipt retry sends creation confirmation and result once, wit
   assert.deepEqual(h.deliveries.map(([, index]) => index), ['received_1', 'start_0', 0]);
 });
 
-test('new-thread wait returns only matching run output and rejects another run', async () => {
-  const result = { thread: { threadId: 'a', latestRunId: 'r', status: 'completed' }, messages: [
-    { role: 'assistant', runId: 'old', text: 'wrong' }, { role: 'assistant', runId: 'r', text: 'right' }] };
-  const call = async () => JSON.stringify(result);
-  assert.equal(await waitForThread({ threadId: 'a' }, 'r', { call }), 'right');
-  await assert.rejects(waitForThread({ threadId: 'a' }, 'other', { call }), /其他任务/);
+test('new-thread wait requests its exact run even after a desktop client starts another turn', async () => {
+  const read = async (_, runId) => {
+    assert.equal(runId, 'r');
+    return { threadId: 'a', runId, status: 'completed', reply: 'right' };
+  };
+  assert.equal(await waitForThread({ threadId: 'a' }, 'r', { read, probe: () => 'alive' }), 'right');
 });
 
 test('a failed reply does not block later results on the same thread and remains retryable', async () => {

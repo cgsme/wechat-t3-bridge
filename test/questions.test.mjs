@@ -153,8 +153,8 @@ test('question drafts are isolated by selected thread and can be rediscovered af
 
 test('nonblocking pending questions end the background wait so the thread lane can accept an answer', async () => {
   const result = await waitForThread({ threadId: 'a' }, 'run', {
-    call: async () => JSON.stringify({ thread: { threadId: 'a', latestRunId: 'run', status: 'running', pendingRequestCount: 1 } }),
-    pending: async () => request,
+    probe: () => 'alive',
+    read: async () => ({ threadId: 'a', runId: 'run', status: 'waiting', request }),
     pause: async () => { throw new Error('blocked waiting for an answer'); },
   });
   assert.equal(result.request.requestId, 'req-1');

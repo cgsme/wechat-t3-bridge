@@ -1,7 +1,25 @@
-import { catalogThreads } from './thread-labels.mjs';
-
 const RUNNING = new Set(['preparing', 'queued', 'starting', 'running']);
 const TASKS = new Set(['task', 'new', 'answer']);
+
+// Capture only accepted WeChat work before recover() converts it to a notice.
+// Persist separately because delivering that notice removes the inbox job.
+export function recoverTypingTasks(state) {
+  const tasks = state.typingTasks ||= [];
+  for (const job of state.jobs) {
+    if (job.status !== 'running' || !TASKS.has(job.command?.kind === 'chat' ? 'task' : job.command?.kind)) continue;
+    const threadId = job.createdThread?.threadId || job.threadId;
+    if (job.waitOnly && job.runId && threadId && (job.command?.kind !== 'new' || job.createdThread)) {
+      // The resumed inbox job owns its status; a second observer can outlive it.
+      for (let index = tasks.length - 1; index >= 0; index--) {
+        if (tasks[index].threadId === threadId && tasks[index].runId === job.runId) tasks.splice(index, 1);
+      }
+      continue;
+    }
+    if (!threadId || tasks.some(task => task.threadId === threadId && task.runId === job.runId)) continue;
+    tasks.push({ threadId, projectId: job.projectId || job.createdThread?.projectId || job.replyThread?.projectId,
+      runId: job.runId });
+  }
+}
 
 export function isRunningThread(thread, projectId) {
   return thread.projectId === projectId && !thread.archived
@@ -10,19 +28,18 @@ export function isRunningThread(thread, projectId) {
 }
 
 // Typing belongs to the owner's WeChat conversation, shared by all task lanes.
-// T3 polling and typing requests run independently of each other and of tasks.
-export function createTypingIndicator({ state, config, projectId, backend, api, owner,
-  status = () => {}, now = Date.now, refreshMs = 5000, pollMs = 5000,
+// Only recovered WeChat tasks need polling; live jobs already carry their status.
+export function createTypingIndicator({ state, config, backend, api, owner,
+  save = () => {}, status = () => {}, now = Date.now, refreshMs = 5000, pollMs = 5000,
   retryMs = 5000, ticketMs = 5 * 60000 }) {
-  let externalRunning = false;
-  const projectActivity = new Map();
   let nextPollAt = 0, nextRefreshAt = 0, retryAt = 0;
   let polling = null, updating = null, closing = null, fatal;
   let stopped = false, sentActive = false, cancelNeeded = false;
   let ticket, ticketContext, ticketUntil = 0, replyRevision = 0;
 
-  const wanted = () => !stopped && (externalRunning || state.jobs.some(job =>
-    ['pending', 'running'].includes(job.status) && TASKS.has(job.command?.kind)));
+  const wanted = () => !stopped && (state.typingTasks?.length > 0 || state.jobs.some(job =>
+    ['pending', 'running'].includes(job.status) && TASKS.has(job.command?.kind)
+    && !['waiting_permission', 'reconnecting'].includes(job.trackingStatus)));
   const context = () => state.typingContext || state.jobs.findLast(job => job.context)?.context;
 
   function refresh() {
@@ -65,28 +82,24 @@ export function createTypingIndicator({ state, config, projectId, backend, api, 
   function tick() {
     if (fatal) throw fatal;
     if (stopped) return;
-    if (!polling && now() >= nextPollAt) {
+    if (state.typingTasks?.length && !polling && now() >= nextPollAt) {
       polling = (async () => {
-        let results;
-        let projectIds;
-        try {
-          projectIds = [...new Set([projectId, state.routing?.projectId,
-            ...Object.keys(state.routing?.projectThreads || {}), ...state.jobs.map(job => job.projectId)].filter(Boolean))];
-          results = await Promise.allSettled(projectIds.map(async id => {
-            const threads = await backend.list(config, id);
-            if (!Array.isArray(threads)) throw new Error('Invalid thread list');
-            catalogThreads(state, threads);
-            return threads.some(thread => isRunningThread(thread, id));
-          }));
-        } catch {
-          status({ activityError: 'T3 activity check failed; will retry.' });
-          return;
-        }
+        const tasks = [...state.typingTasks];
+        const results = await Promise.allSettled(tasks.map(async task => {
+          const thread = await backend.read({ ...config, threadId: task.threadId });
+          if (!thread || thread.threadId !== task.threadId) throw new Error('Invalid recovered thread');
+          return isRunningThread(thread, task.projectId || thread.projectId)
+            && (!task.runId || !thread.latestRunId || thread.latestRunId === task.runId);
+        }));
         if (!stopped) {
+          let changed = false;
           results.forEach((result, index) => {
-            if (result.status === 'fulfilled') projectActivity.set(projectIds[index], result.value);
+            if (result.status === 'fulfilled' && !result.value) {
+              state.typingTasks.splice(state.typingTasks.indexOf(tasks[index]), 1);
+              changed = true;
+            }
           });
-          externalRunning = projectIds.some(id => projectActivity.get(id));
+          if (changed) save();
           status({ activityError: results.some(result => result.status === 'rejected') ? 'T3 activity check failed; will retry.' : null });
         }
       })().catch(error => { fatal = error; }).finally(() => {

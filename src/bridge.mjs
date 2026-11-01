@@ -8,7 +8,7 @@ import { commitUpdates, recover, threadLabel } from './core.mjs';
 import { checkBackend, backend } from './backend.mjs';
 import { createScheduler } from './scheduler.mjs';
 import { catalogThreads } from './thread-labels.mjs';
-import { createTypingIndicator } from './typing.mjs';
+import { createTypingIndicator, recoverTypingTasks } from './typing.mjs';
 import { sendTrackedReply, rememberMessage, quotePeer } from './quotes.mjs';
 import { prepareHtmlReply, readPreparedHtml } from './html-attachments.mjs';
 
@@ -158,6 +158,7 @@ export async function run() {
       && !thread.archived && thread.relationshipToParent !== 'subagent');
     catalogThreads(state, threads);
   } catch {}
+  recoverTypingTasks(state);
   recover(state);
   const save = () => write('state.json', state);
   save();
@@ -174,13 +175,15 @@ export async function run() {
   };
   status({});
   let stopping = false;
-  process.on('SIGINT', () => { stopping = true; });
-  process.on('SIGTERM', () => { stopping = true; });
+  const tracking = new AbortController();
+  const stop = () => { stopping = true; tracking.abort(); };
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
   console.log('微信桥接已启动。');
 
-  const typing = createTypingIndicator({ state, config: target, projectId: reference.projectId,
-    backend, api, owner: identity.owner, status });
-  const scheduler = createScheduler({ state, config: target, reference, backend, save, status,
+  const typing = createTypingIndicator({ state, config: target,
+    backend, api, owner: identity.owner, save, status });
+  const scheduler = createScheduler({ state, config: target, reference, backend, save, status, signal: tracking.signal,
     prepareReply: (job, reply) => prepareHtmlReply(job, reply, { dataDir, config: target, renderedHtml: backend.renderedHtml }),
     sendAttachment: async (job, attachment, index) => {
       const clientId = `t3_${job.id.slice(0, 32)}_html_${index}`;
@@ -225,7 +228,7 @@ export async function run() {
     }
   }
   } finally {
-    stopping = true;
+    stop();
     await working;
     await typing.stop();
     status({ connected: false });

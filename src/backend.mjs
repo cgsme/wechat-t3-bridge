@@ -1,7 +1,9 @@
 import { spawn } from 'node:child_process';
 import { HISTORY_PAGE_SIZE, validateHistoryPage } from './history.mjs';
+import { activeTaskStatuses, endedTaskStatuses, abortedWait, trackingError, runtimeProbe, taskPause } from './task-tracking.mjs';
 
-export function callT3(config, args, { input = '', timeout = 1800000, spawnImpl = spawn, acceptCodes = [0, 2] } = {}) {
+export function callT3(config, args, { input = '', timeout = 30000, spawnImpl = spawn, acceptCodes = [0, 2], signal = config.signal } = {}) {
+  if (signal?.aborted) return Promise.reject(abortedWait());
   return new Promise((resolve, reject) => {
     const child = spawnImpl(config.command, [...(config.prefixArgs || []), ...args], {
       cwd: config.cwd, env: { ...process.env, ...config.env },
@@ -9,27 +11,41 @@ export function callT3(config, args, { input = '', timeout = 1800000, spawnImpl 
     });
     const output = [];
     let size = 0;
-    let timedOut = false;
-    const timer = setTimeout(() => { timedOut = true; child.kill(); }, timeout);
+    let settled = false;
+    const cleanup = () => { clearTimeout(timer); signal?.removeEventListener('abort', abort); };
+    const stop = error => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      // Reject independently of close: a stuck CLI or inherited pipe may never emit it.
+      reject(error);
+      try { child.kill('SIGKILL'); } catch {}
+      child.stdin.destroy?.(); child.stdout.destroy?.(); child.stderr.destroy?.(); child.unref?.();
+    };
+    const abort = () => stop(abortedWait());
+    const timer = setTimeout(() => stop(trackingError('T3_COMMAND_TIMEOUT',
+      'T3 命令响应超时；提交状态未确认，任务不会自动重跑。')), timeout > 0 ? timeout : 30000);
+    signal?.addEventListener('abort', abort, { once: true });
     child.stdout.on('data', chunk => {
       size += chunk.length;
       if (size <= 2 * 1024 * 1024) output.push(chunk);
-      else child.kill();
+      else stop(trackingError('T3_OUTPUT_TOO_LARGE', 'T3 回复过长，请在桌面端查看结果。'));
     });
     // Drain diagnostics without retaining credentials or internal paths in logs.
     child.stderr.on('data', () => {});
     child.stdin.on('error', () => {});
-    child.on('error', () => { clearTimeout(timer); reject(new Error('无法启动 T3 命令，请检查桌面端安装')); });
+    child.on('error', () => stop(trackingError('T3_CLI_UNAVAILABLE', '无法启动 T3 命令，请检查桌面端安装。')));
     child.on('close', code => {
-      clearTimeout(timer);
-      if (timedOut) return reject(new Error('等待 T3 回复超时，请在 T3 查看进度；任务不会自动重跑'));
-      if (size > 2 * 1024 * 1024) return reject(new Error('T3 回复过长，请在桌面端查看结果'));
+      if (settled) return;
+      settled = true;
+      cleanup();
       const text = Buffer.concat(output).toString('utf8').trim();
-      if (!acceptCodes.includes(code)) return reject(new Error('T3 未正常完成，请在桌面端查看详情；任务不会自动重跑'));
+      if (!acceptCodes.includes(code)) return reject(trackingError('T3_CLI_FAILED',
+        'T3 命令退出，未能确认结果；请检查桌面端连接，任务不会自动重跑。'));
       if (code === 2 && !text) return resolve('T3 正等待补充信息或确认，请在桌面端查看。');
       resolve(text);
     });
-    child.stdin.end(input);
+    try { child.stdin.end(input); } catch { stop(trackingError('T3_CLI_FAILED', 'T3 命令输入失败；任务不会自动重跑。')); }
   });
 }
 
@@ -70,15 +86,18 @@ export async function readThreadHistory(config, page = 1, { call = callT3 } = {}
     hasMore: start > 0 };
 }
 
-export async function createThread(config, { projectId, title, provider, model, prompt, wait = true }) {
+export async function createThread(config, { projectId, title, provider, model, prompt, wait = true }, { call = callT3, waitFor = waitForThread } = {}) {
   if (!provider || !model) throw new Error('当前线程缺少模型配置，无法新建任务线程');
-  const data = parseCliJson(await callT3(config, ['thread', 'start', ...(wait ? ['--wait'] : []), '--json',
+  const data = parseCliJson(await call(config, ['thread', 'start', '--json',
     '--provider', provider, '--model', model, '--title', title, projectId, '-'],
-  { input: prompt, acceptCodes: [0, 1, 2] }));
+  { input: prompt, timeout: 30000, acceptCodes: [0, 1, 2] }));
   // Without --wait, the installed CLI returns only threadId/projectId/runId.
   // Requiring status here loses an already-created thread and its background run.
-  if (!data.threadId || (wait ? !data.status : !data.runId)) {
+  if (!data.threadId || !data.runId) {
     throw new Error('无法确认新线程是否创建成功，请在 T3 检查；不会自动重试');
+  }
+  if (wait && (!data.status || activeTaskStatuses.has(data.status))) {
+    return { ...data, ...await waitFor({ ...config, threadId: data.threadId }, data.runId, { structured: true }) };
   }
   return data;
 }
@@ -86,7 +105,7 @@ export async function createThread(config, { projectId, title, provider, model, 
 // Lazy imports keep CLI helpers usable by the local MCP adapter without a cycle at startup.
 export const backend = {
   read: checkBackend, list: listThreads, history: readThreadHistory, create: createThread,
-  send: (config, prompt) => sendToBackend(config, prompt, { includeRunId: true }), wait: waitForThread,
+  send: (config, prompt) => sendToBackend(config, prompt, { includeRunId: true, wait: false }), wait: waitForThread,
   renderedHtml: async (...args) => (await import('./t3-control.mjs')).readRenderedHtml(...args),
   projects: async (...args) => (await import('./t3-control.mjs')).readProjects(...args),
   project: async (...args) => (await import('./t3-control.mjs')).readProject(...args),
@@ -108,31 +127,70 @@ export async function readPendingRequest(...args) {
   return (await import('./t3-control.mjs')).readPendingRequest(...args);
 }
 
-export async function waitForThread(config, runId, { call = callT3, pending = readPendingRequest, pause = ms => new Promise(resolve => setTimeout(resolve, ms)), timeout = 1800000 } = {}) {
-  const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
-    const data = parseCliJson(await call(config, ['thread', 'show', '--messages', '50', '--json', config.threadId], { timeout: 20000 }));
-    if (data.thread?.threadId !== config.threadId) throw new Error('T3 目标会话校验失败');
-    if (runId && data.thread.latestRunId !== runId) throw new Error('线程出现了其他任务，请在 T3 查看原任务结果');
-    if (data.thread.pendingRequestCount > 0 || data.thread.status === 'waiting') {
-      const request = await pending(config);
-      if (request) return { status: 'waiting', threadId: config.threadId, runId: runId || data.thread.latestRunId, request };
-      return 'T3 正等待确认，请在桌面端处理权限确认。补充问题可用 /questions 查看。';
+export async function waitForThread(config, runId, {
+  read = async (target, id) => (await import('./t3-control.mjs')).readTaskState(target, id),
+  probe = runtimeProbe(config), pause = taskPause, now = () => performance.now(),
+  onRun = () => {}, onProgress = () => {}, structured = false, signal = config.signal,
+} = {}) {
+  if (!runId) throw trackingError('T3_INVALID_TASK', '任务编号缺失，无法安全跟踪；不会重新提交任务。');
+  let retryDelay = 5000, disconnectedAt, progress;
+  const report = status => { if (status !== progress) { progress = status; onProgress(status); } };
+  for (;;) {
+    if (signal?.aborted) throw abortedWait();
+    if (probe() === 'exited') throw trackingError('T3_SERVER_EXITED', 'T3 进程已退出，已停止等待；原任务状态未确认，不会自动重跑。请重新打开 T3 后查看 /status 或 /history。');
+    let data;
+    try {
+      if (disconnectedAt !== undefined && now() - disconnectedAt >= 120000) {
+        throw trackingError('T3_TRACKING_LOST', '与 T3 持续失联超过 2 分钟，已停止等待；原任务状态未确认，不会自动重跑。请恢复连接后查看 /status 或 /history。');
+      }
+      const trackingTimeoutMs = disconnectedAt === undefined ? 45000 : Math.max(1, Math.min(45000, 120000 - (now() - disconnectedAt)));
+      data = await read({ ...config, signal, trackingTimeoutMs }, runId);
+    } catch (error) {
+      if (signal?.aborted) throw abortedWait();
+      if (probe() === 'exited') throw trackingError('T3_SERVER_EXITED', 'T3 进程已退出，已停止等待；原任务状态未确认，不会自动重跑。请重新打开 T3 后查看 /status 或 /history。');
+      if (!['T3_COMMAND_TIMEOUT', 'T3_CONNECTION_LOST', 'T3_CLI_FAILED'].includes(error.code)) throw error;
+      if (disconnectedAt === undefined) { disconnectedAt = now(); report('reconnecting'); }
+      const remaining = 120000 - (now() - disconnectedAt);
+      if (remaining <= 0) throw trackingError('T3_TRACKING_LOST', '与 T3 持续失联超过 2 分钟，已停止等待；原任务状态未确认，不会自动重跑。请恢复连接后查看 /status 或 /history。');
+      await pause(Math.min(retryDelay, remaining), signal);
+      retryDelay = Math.min(retryDelay * 2, 30000);
+      continue;
     }
-    if (['completed', 'waiting', 'failed', 'cancelled', 'interrupted', 'rolled_back'].includes(data.thread.status)) {
-      const reply = (data.messages || []).filter(message => message.role === 'assistant' && (!runId || message.runId === runId)).at(-1)?.text;
-      if (data.thread.status === 'waiting') return 'T3 正等待补充信息或确认，请在桌面端查看。';
-      return reply || `任务状态：${data.thread.status}，请在 T3 查看详情。`;
+    disconnectedAt = undefined;
+    retryDelay = 5000;
+    if (data?.threadId !== config.threadId || !data.runId ||
+      !activeTaskStatuses.has(data.status) && !endedTaskStatuses.has(data.status) && data.status !== 'waiting') {
+      throw trackingError('T3_INVALID_TASK', 'T3 任务状态校验失败，已停止跟踪；请在 T3 核对原任务，不会自动重跑。');
     }
-    await pause(1000);
+    if (data.runId !== runId) { runId = data.runId; onRun(runId); }
+    if (data.status === 'waiting') {
+      if (data.request) return data;
+      report('waiting_permission');
+      await pause(3000, signal);
+      continue;
+    }
+    if (endedTaskStatuses.has(data.status)) {
+      const reply = data.status === 'completed' ? data.reply || '任务已完成，未返回文本结果；请在 T3 查看详情。'
+        : `任务状态：${data.status}。${data.error ? '\n' + data.error : '\n请在 T3 查看详情。'}`;
+      return structured ? { ...data, reply } : reply;
+    }
+    report('running');
+    await pause(3000, signal);
   }
-  throw new Error('等待 T3 回复超时，请在 T3 查看进度；任务不会自动重跑');
 }
 
-export async function sendToBackend(config, prompt, { call = callT3, pending = readPendingRequest, includeRunId = false } = {}) {
-  const result = parseCliJson(await call(config, ['thread', 'send', '--wait', '--json', config.threadId, '-'],
-    { input: prompt, acceptCodes: [0, 1, 2] }));
-  if (result.threadId !== config.threadId || !result.status) throw new Error('T3 任务响应校验失败，请在 T3 查看；不会自动重跑');
+export async function sendToBackend(config, prompt, { call = callT3, pending = readPendingRequest, includeRunId = false, wait = true, waitFor = waitForThread } = {}) {
+  const result = parseCliJson(await call(config, ['thread', 'send', '--json', config.threadId, '-'],
+    { input: prompt, timeout: 30000, acceptCodes: [0, 1, 2] }));
+  if (result.threadId !== config.threadId || !result.runId || !result.status ||
+    !activeTaskStatuses.has(result.status) && !endedTaskStatuses.has(result.status) && result.status !== 'waiting') {
+    throw new Error('T3 任务响应校验失败，请在 T3 查看；不会自动重跑');
+  }
+  if (activeTaskStatuses.has(result.status)) {
+    if (!wait) return result;
+    const outcome = await waitFor(config, result.runId, { structured: includeRunId });
+    return outcome;
+  }
   if (result.status === 'waiting') return { ...result, request: await pending(config) };
   const reply = result.reply || result.error || `任务状态：${result.status}，请在 T3 查看详情。`;
   return includeRunId ? { threadId: result.threadId, runId: result.runId, status: result.status, reply } : reply;

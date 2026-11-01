@@ -177,24 +177,19 @@ test('legacy bound inbox jobs acquire their original project before any project 
   assert.deepEqual(h.calls.at(-1), ['send', 'a', 'saved']);
 });
 
-test('typing monitors selected and previous projects independently when one project is unavailable', async () => {
+test('desktop tasks in selected and previous projects never trigger typing scans', async () => {
   const h = harness();
-  h.state.typingContext = 'owner-context';
   await h.execute('/project p2');
+  h.threads.get('a').status = 'running';
   h.threads.get('b').status = 'running';
-  const list = h.backend.list, polls = [], sent = [], reports = [];
-  h.backend.list = async (config, id) => {
-    polls.push(id);
-    if (id === 'p1') throw new Error('project temporarily unavailable');
-    return list(config, id);
-  };
-  const indicator = createTypingIndicator({ state: h.state, config: h.config, projectId: 'p1', backend: h.backend,
+  const polls = [], sent = [];
+  h.backend.list = async (_, id) => { polls.push(id); throw new Error('must not scan projects'); };
+  const indicator = createTypingIndicator({ state: h.state, config: h.config, backend: h.backend,
     api: { getConfig: async () => ({ typing_ticket: 'ticket' }), sendTyping: async (_, __, active) => sent.push(active) },
-    owner: 'owner', status: report => reports.push(report) });
-  indicator.tick(); await flush(); await flush();
-  assert.ok(polls.includes('p1') && polls.includes('p2'));
-  assert.equal(sent.at(-1), true);
-  assert.ok(reports.some(report => report.activityError));
+    owner: 'owner' });
+  indicator.tick(); await flush();
+  assert.deepEqual(polls, []);
+  assert.deepEqual(sent, []);
   await indicator.stop();
 });
 

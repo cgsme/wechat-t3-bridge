@@ -5,10 +5,12 @@ import { projectRouting } from './projects.mjs';
 import { describeThread, numberedThread } from './thread-labels.mjs';
 import { QUOTE_COMMANDS, rememberInbound, resolveQuote } from './quotes.mjs';
 import { queuesByThread } from './command-policy.mjs';
+import { waitForJob } from './task-tracking.mjs';
 
 // One dispatcher preserves routing order; independent thread lanes run concurrently.
 export function createScheduler({ state, config, reference, backend, save, send, status = () => {},
-  now = Date.now, prepareReply, sendAttachment }) {
+  now = Date.now, prepareReply, sendAttachment, signal }) {
+  if (signal) config = { ...config, signal };
   projectRouting(state, config, reference);
   for (const job of state.jobs) if (job.bound || job.status === 'running') job.projectId ||= state.routing.projectId;
   if (!state.routing.threadInfo && reference.threadId === state.routing.threadId) state.routing.threadInfo = threadInfo(reference);
@@ -42,6 +44,7 @@ export function createScheduler({ state, config, reference, backend, save, send,
         if (prepareReply) reply = await prepareReply(job, reply);
       }
       catch (error) {
+        if (signal?.aborted || error.code === 'T3_WAIT_ABORTED') return;
         reply = job.command.kind === 'new' && job.createdThread
           ? `新线程已创建，任务结果暂未获取。\n${error.message}\n请在 T3 查看任务状态；不会自动重新创建线程或重跑任务。`
           : error.message;
@@ -116,7 +119,7 @@ export function createScheduler({ state, config, reference, backend, save, send,
           job.noticeSent = 0;
           save();
           release();
-          const outcome = await backend.wait({ ...config, threadId: created.threadId }, result.runId);
+          const outcome = await waitForJob({ state, job, thread: created, config, backend, save });
           return typeof outcome === 'string' ? `新线程任务结果：\n${outcome}` : rememberQuestion(state, created, outcome, save, job.replyTo);
         });
         // Creation failures must also release the routing barrier.
@@ -135,6 +138,7 @@ export function createScheduler({ state, config, reference, backend, save, send,
     }
   }
   function tick() {
+    if (signal?.aborted) return;
     if (fatal) throw fatal;
     if (!dispatching) dispatching = dispatch().catch(error => { fatal = error; }).finally(() => { dispatching = null; });
     const busy = new Set([...active.values()].map(job => job.threadId));

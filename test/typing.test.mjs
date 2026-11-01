@@ -1,27 +1,39 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { WechatApi } from '../src/api.mjs';
-import { ingest } from '../src/core.mjs';
+import { ingest, recover } from '../src/core.mjs';
 import { createScheduler } from '../src/scheduler.mjs';
-import { createTypingIndicator, isRunningThread } from '../src/typing.mjs';
+import { createTypingIndicator, isRunningThread, recoverTypingTasks } from '../src/typing.mjs';
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 const thread = (threadId, status = 'running', extra = {}) => ({ threadId, status, projectId: 'project',
   title: `Name ${threadId}`, link: `https://test/${threadId}`, ...extra });
 
+test('desktop activity never starts typing or causes project scans', async () => {
+  const h = harness();
+  h.rows([thread('desktop')]);
+  h.state.routing = { projectId: 'project', projectThreads: { previous: 'old' } };
+  await h.tick(); h.advance(5000); await h.tick();
+  assert.equal(h.sends.length, 0);
+  assert.equal(h.polls(), 0);
+});
+
 function harness() {
   const state = { jobs: [], seen: [], typingContext: 'owner-context' };
-  const configs = [], sends = [], reports = [];
+  const configs = [], sends = [], reports = [], saved = [];
   let clock = 0, rows = [], polls = 0;
   const api = {
     getConfig: async (owner, context) => { configs.push({ owner, context }); return { typing_ticket: `ticket-${configs.length}` }; },
     sendTyping: async (owner, ticket, active) => { sends.push({ owner, ticket, active }); },
   };
-  const backend = { list: async () => { polls++; return rows; } };
-  const indicator = createTypingIndicator({ state, config: { threadId: 'home' }, projectId: 'project',
-    backend, api, owner: 'owner', now: () => clock, status: value => reports.push(value) });
-  return { state, api, backend, indicator, configs, sends, reports,
+  const reads = [];
+  const backend = { list: async () => { polls++; return rows; },
+    read: async config => { reads.push(config.threadId); return rows.find(row => row.threadId === config.threadId); } };
+  const indicator = createTypingIndicator({ state, config: { threadId: 'home' },
+    backend, api, owner: 'owner', save: () => saved.push(structuredClone(state)),
+    now: () => clock, status: value => reports.push(value) });
+  return { state, api, backend, indicator, configs, sends, reports, reads, saved,
     rows: value => { rows = value; }, advance: ms => { clock += ms; },
     polls: () => polls, tick: async () => { indicator.tick(); await flush(); } };
 }
@@ -97,18 +109,60 @@ test('only usable running top-level threads in the bound project count as activi
   }
 });
 
-test('desktop tasks and tasks surviving a bridge restart hold typing with no local jobs', async () => {
+test('only saved WeChat tasks retain typing across restarts until their run ends', async () => {
   const h = harness();
-  delete h.state.typingContext;
-  h.rows([thread('desktop'), thread('recovered')]);
+  h.state.jobs.push({ command: { kind: 'task' }, status: 'running', threadId: 'recovered',
+    projectId: 'project', runId: 'wechat-run' });
+  recoverTypingTasks(h.state); recover(h.state);
+  h.state.jobs = []; // The recovery notice has been delivered.
+  Object.assign(h.state, JSON.parse(JSON.stringify(h.state)));
+  recoverTypingTasks(h.state); // Another restart retains the saved tracker.
+  h.rows([thread('desktop'), thread('recovered', 'running', { latestRunId: 'wechat-run' })]);
   await h.tick();
   assert.deepEqual(h.sends.map(call => call.active), [true]);
-  assert.equal(h.configs[0].context, undefined);
-  h.rows([thread('desktop', 'completed'), thread('recovered')]);
+  assert.deepEqual(h.reads, ['recovered']);
+  assert.equal(h.polls(), 0);
+  h.rows([thread('desktop'), thread('recovered', 'running', { latestRunId: 'desktop-run' })]);
   h.advance(5000); await h.tick();
-  assert.ok(h.sends.every(call => call.active));
-  h.rows([thread('desktop', 'completed'), thread('recovered', 'waiting')]);
+  assert.equal(h.sends.at(-1).active, false);
+  assert.deepEqual(h.state.typingTasks, []);
+  assert.deepEqual(h.saved.at(-1).typingTasks, []);
   h.advance(5000); await h.tick();
+  assert.deepEqual(h.reads, ['recovered', 'recovered']);
+});
+
+test('recovery captures running WeChat tasks and creations without including controls or completed work', () => {
+  const state = { jobs: [
+    { command: { kind: 'new' }, status: 'running', createdThread: { threadId: 'new', projectId: 'other' }, runId: 'run' },
+    { command: { kind: 'chat' }, status: 'running', threadId: 'legacy' },
+    ...['threads', 'status', 'steer'].map(kind => ({ command: { kind }, status: 'running', threadId: kind })),
+    { command: { kind: 'task' }, status: 'reply', threadId: 'done' },
+    { command: { kind: 'new' }, status: 'running' },
+  ] };
+  recoverTypingTasks(state); recoverTypingTasks(state);
+  assert.deepEqual(state.typingTasks.map(task => task.threadId), ['new', 'legacy']);
+  assert.equal(state.typingTasks[0].projectId, 'other');
+});
+
+test('recovered tasks stop independently when completed or waiting, and late reads cannot restart after stop', async () => {
+  const h = harness();
+  h.state.typingTasks = ['one', 'two'].map(threadId => ({ threadId, projectId: 'project' }));
+  h.rows([thread('one'), thread('two')]); await h.tick();
+  h.rows([thread('one', 'completed'), thread('two')]);
+  h.advance(5000); await h.tick();
+  assert.deepEqual(h.state.typingTasks.map(task => task.threadId), ['two']);
+  assert.equal(h.sends.at(-1).active, true);
+  h.rows([thread('two', 'running', { pendingRequestCount: 1 })]);
+  h.advance(5000); await h.tick();
+  assert.equal(h.sends.at(-1).active, false);
+  assert.deepEqual(h.saved.at(-1).typingTasks, []);
+
+  const reading = deferred();
+  h.state.typingTasks.push({ threadId: 'late' });
+  h.backend.read = () => reading.promise;
+  h.advance(5000); await h.tick();
+  await h.indicator.stop();
+  reading.resolve(thread('late')); await flush(); await h.tick();
   assert.equal(h.sends.at(-1).active, false);
 });
 
@@ -119,7 +173,7 @@ test('idle controls and undelivered results do not start typing or flood the con
   await h.tick(); await h.tick(); h.advance(5000); await h.tick();
   assert.equal(h.sends.length, 0);
   assert.equal(h.configs.length, 0);
-  assert.equal(h.polls(), 2);
+  assert.equal(h.polls(), 0);
   h.state.jobs.push({ command: { kind: 'task' }, status: 'pending' });
   await h.tick();
   assert.equal(h.sends.at(-1).active, true);
@@ -127,7 +181,7 @@ test('idle controls and undelivered results do not start typing or flood the con
 
 test('reply delivery renews typing immediately when another thread remains active', async () => {
   const h = harness();
-  h.rows([thread('background')]); await h.tick();
+  h.state.jobs.push({ command: { kind: 'task' }, status: 'running' }); await h.tick();
   h.advance(100); h.indicator.replySent(); await h.tick();
   assert.deepEqual(h.sends.map(call => call.active), [true, true]);
   await h.tick(); assert.equal(h.sends.length, 2);
@@ -186,16 +240,14 @@ test('a task finishing during config retrieval does not send a late typing start
   assert.equal(h.sends.length, 0);
 });
 
-test('stop cancels an in-flight typing start and never restarts on a late T3 poll', async () => {
-  const h = harness(), response = deferred(), listing = deferred();
+test('stop cancels an in-flight typing start and never restarts on later ticks', async () => {
+  const h = harness(), response = deferred();
   h.state.jobs.push({ command: { kind: 'task' }, status: 'running' });
-  h.backend.list = () => listing.promise;
   const send = h.api.sendTyping;
   h.api.sendTyping = async (...args) => { await send(...args); if (args[2]) await response.promise; };
   await h.tick();
   const closing = h.indicator.stop();
   response.resolve(); await closing;
-  listing.resolve([thread('still-running')]); await flush();
   await h.indicator.stop(); h.advance(6000); await h.tick();
   assert.deepEqual(h.sends.map(call => call.active), [true, false]);
 });
@@ -212,23 +264,26 @@ test('a timed-out typing start is still cancelled when work ends, and failed can
   assert.deepEqual(h.sends.map(call => call.active), [true, false, false]);
 });
 
-test('failed activity polls preserve last known activity and recover independently', async () => {
-  const h = harness(); h.rows([thread('background')]); await h.tick();
-  const list = h.backend.list;
-  h.backend.list = async () => { throw new Error('sensitive diagnostics'); };
+test('failed recovery reads preserve saved WeChat activity and retry without project scans', async () => {
+  const h = harness();
+  h.state.typingTasks = [{ threadId: 'recovered', projectId: 'project' }];
+  h.rows([thread('recovered')]); await h.tick();
+  const read = h.backend.read;
+  h.backend.read = async () => { throw new Error('sensitive diagnostics'); };
   h.advance(5000); await h.tick();
   assert.ok(h.sends.every(call => call.active));
   assert.ok(h.reports.some(report => report.activityError));
-  h.backend.list = list; h.rows([]); h.advance(5000); await h.tick();
+  h.backend.read = read; h.rows([thread('recovered', 'completed')]);
+  h.advance(5000); await h.tick();
   assert.equal(h.sends.at(-1).active, false);
+  assert.equal(h.polls(), 0);
   assert.equal(JSON.stringify(h.reports).includes('sensitive'), false);
 });
 
-test('slow typing and activity endpoints do not block independent scheduler lanes', async () => {
-  const h = harness(), config = deferred(), listing = deferred();
+test('slow typing requests do not block independent scheduler lanes', async () => {
+  const h = harness(), config = deferred();
   const tasks = [deferred(), deferred()], starts = [], replies = [];
   h.api.getConfig = () => config.promise;
-  h.backend.list = () => listing.promise;
   h.backend.read = async c => thread(c.threadId);
   h.backend.send = async c => { starts.push(c.threadId); return tasks[starts.length - 1].promise; };
   h.state.routing = { threadId: 'one', listedIds: [] };
@@ -241,7 +296,7 @@ test('slow typing and activity endpoints do not block independent scheduler lane
   tasks[1].resolve('second done'); await flush(); scheduler.tick(); await h.tick();
   assert.deepEqual(replies, ['1']);
   assert.equal(h.state.jobs[0].status, 'running');
-  config.resolve({ typing_ticket: 'ticket' }); listing.resolve([]); await flush();
+  config.resolve({ typing_ticket: 'ticket' }); await flush();
   await h.tick(); assert.equal(h.sends.at(-1).active, true);
   tasks[0].resolve('first done'); await flush(); scheduler.tick(); await h.tick();
   assert.deepEqual(replies, ['1', '0']);

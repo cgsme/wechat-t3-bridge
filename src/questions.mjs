@@ -2,6 +2,7 @@
 // submitted as a new agent prompt. One WeChat reply answers one question.
 import { threadLabel, emojiNumber } from './core.mjs';
 import { numberedThread } from './thread-labels.mjs';
+import { waitForJob } from './task-tracking.mjs';
 
 function nextQuestion(draft) {
   return draft.questions.find(question => !Object.hasOwn(draft.answers, question.id));
@@ -94,7 +95,10 @@ export async function answerQuestion({ state, thread, target, backend, text, sav
   catch { return '答案提交状态未确认，请用 /questions 核对后重新回答，或在 T3 查看；不会自动重复提交。'; }
   delete state.pendingInputs[thread.threadId];
   save();
-  if (job) { job.runId = draft.runId || thread.latestRunId; save(); }
-  const result = await backend.wait(target, draft.runId || thread.latestRunId);
+  const trackingJob = job || {};
+  trackingJob.runId = draft.runId || thread.latestRunId;
+  trackingJob.waitOnly = true;
+  save();
+  const result = await waitForJob({ state, job: trackingJob, thread, config: target, backend, save });
   return typeof result === 'string' ? result : rememberQuestion(state, thread, result, save, draft.originalQuestion);
 }

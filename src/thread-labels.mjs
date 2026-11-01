@@ -24,7 +24,7 @@ export function numberedThread(thread, state) {
 }
 
 export function describeThread(thread, { state }) {
-  // Catalog reads run at startup and with the existing activity polls. A slow
+  // Catalog reads run at startup and through explicit thread commands. A slow
   // list endpoint must never hold a task's execution lane or its final reply.
   return numberedThread(thread, state);
 }
