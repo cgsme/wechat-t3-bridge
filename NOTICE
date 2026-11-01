@@ -1,0 +1,10 @@
+WeChat T3 Bridge is an independent community project, not affiliated with
+Tencent or T3 Code. Product names belong to their respective owners.
+
+Runtime dependency: qrcode (MIT), https://github.com/soldair/node-qrcode
+Transitive dependencies retain their respective licenses in their packages.
+Dependency versions and integrity hashes are recorded in package-lock.json.
+
+Protocol references are linked in README.md. Referencing an upstream protocol
+does not relicense upstream source code or trademarks under this project's MIT
+license.

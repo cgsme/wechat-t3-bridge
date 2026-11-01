@@ -1,0 +1,20 @@
+{
+  "name": "wechat-t3-bridge",
+  "version": "0.7.15",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "start": "node src/bridge.mjs run",
+    "login": "node src/bridge.mjs login",
+    "status": "node src/bridge.mjs status"
+  },
+  "dependencies": {
+    "qrcode": "1.5.4"
+  },
+  "description": "Bridge personal WeChat ClawBot messages to a local T3 Code instance",
+  "license": "MIT"
+}
