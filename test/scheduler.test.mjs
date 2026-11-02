@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createScheduler } from '../src/scheduler.mjs';
 import { waitForThread } from '../src/backend.mjs';
+import { trackingOptions } from '../src/task-tracking.mjs';
 
 const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
 const flush = () => new Promise(resolve => setImmediate(resolve));
@@ -21,8 +22,70 @@ function harness() {
     send: async (job, chunk, index) => { if (fail && job.id === '1') throw new Error('offline'); sends.push([job.id, chunk]); deliveries.push([job.id, index]); } });
   const add = command => { const job = { id: String(state.jobs.length + state.seen.length + 1), command, status: 'pending', sent: 0 }; state.jobs.push(job); return job; };
   const tick = async () => { scheduler.tick(); await flush(); };
-  return { state, calls, sends, deliveries, pending, backend, add, tick, fail: () => { fail = true; }, retry: () => { fail = false; clock = 10000; } };
+  return { state, calls, sends, deliveries, pending, backend, add, tick, advance: ms => { clock += ms; },
+    fail: () => { fail = true; }, retry: () => { fail = false; clock = 10000; } };
 }
+
+test('fast tasks return only results, slow tasks acknowledge once and queued tasks explain the queue', async () => {
+  const fast = harness(); fast.add({ kind: 'task', text: 'fast' });
+  await fast.tick(); await fast.tick();
+  fast.advance(4000); fast.pending[0].resolve('fast result'); await flush(); await fast.tick();
+  assert.equal(fast.sends.length, 1);
+  assert.match(fast.sends[0][1], /fast result/);
+
+  const slow = harness(); slow.add({ kind: 'task', text: 'slow' });
+  slow.add({ kind: 'task', text: 'queued' });
+  await slow.tick(); await slow.tick();
+  slow.advance(4999); await slow.tick(); assert.equal(slow.sends.length, 0);
+  slow.advance(1); await slow.tick();
+  assert.equal(slow.sends.length, 2);
+  assert.match(slow.sends[0][1], /正在处理/);
+  assert.match(slow.sends[1][1], /正在排队/);
+  slow.advance(30000); await slow.tick(); assert.equal(slow.sends.length, 2);
+  slow.pending[0].resolve('slow result'); await flush(); await slow.tick(); await slow.tick();
+  slow.pending[1].resolve('queued result'); await flush(); await slow.tick();
+  assert.equal(slow.sends.length, 4);
+});
+
+test('progress that recovers before delivery is skipped and cannot delay the final result', async () => {
+  const h = harness(), item = h.add({ kind: 'task', text: 'work' });
+  await h.tick(); await h.tick();
+  item.noticeChunks = ['obsolete permission reminder'];
+  item.noticeKinds = { 0: 'waiting_permission' };
+  item.trackingStatus = 'running';
+  await h.tick(); assert.equal(h.sends.length, 0);
+  h.pending[0].resolve('done'); await flush(); await h.tick();
+  assert.equal(h.sends.length, 1); assert.match(h.sends[0][1], /done/);
+});
+
+test('an unsent permission reminder may return if still needed, but a delivered reminder is never repeated', async () => {
+  const h = harness(), item = h.add({ kind: 'task', text: 'work' });
+  await h.tick(); await h.tick();
+  const options = trackingOptions(item, () => {});
+  const permission = { notify: true, approval: { id: 'permission' } };
+  options.onProgress('waiting_permission', permission);
+  options.onProgress('running');
+  await h.tick(); assert.equal(h.sends.length, 0);
+  options.onProgress('waiting_permission', permission);
+  await h.tick(); assert.equal(h.sends.length, 1);
+  options.onProgress('running'); options.onProgress('waiting_permission', permission);
+  await h.tick(); assert.equal(h.sends.length, 1);
+  h.pending[0].resolve('done'); await flush(); await h.tick();
+  assert.equal(h.sends.length, 2);
+});
+
+test('a failed delayed receipt is discarded as soon as the result arrives, while final delivery still retries', async () => {
+  const h = harness(); h.add({ kind: 'task', text: 'work' });
+  await h.tick(); await h.tick();
+  h.fail(); h.advance(5000); await h.tick();
+  assert.equal(h.state.jobs[0].progressRetry, true);
+  h.pending[0].resolve('done'); await flush(); await h.tick();
+  assert.equal(h.state.jobs[0].receiptSent, 1);
+  assert.equal(h.state.jobs[0].sent, 0);
+  assert.equal(h.sends.length, 0);
+  h.retry(); h.advance(5000); await h.tick();
+  assert.equal(h.sends.length, 1); assert.match(h.sends[0][1], /done/);
+});
 
 test('different threads execute concurrently; same-thread messages keep order and bound targets', async () => {
   const h = harness();

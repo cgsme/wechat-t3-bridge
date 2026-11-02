@@ -86,6 +86,49 @@ test('failed or interrupted tasks return their own error rather than a partial a
   }
 });
 
+test('waiting alone is never evidence of a desktop permission request', async () => {
+  const h = transport({ status: 'waiting', thread: { latestRunId: 'run', activeRunId: 'run', pendingRequestCount: 0 },
+    respond: (name, args, fallback) => name === 't3_pending_request' ? { requestIds: [] } : fallback });
+  const result = await h.read();
+  assert.equal(result.status, 'waiting');
+  assert.equal(result.approval, undefined);
+  assert.equal(h.tools.some(([name, args]) => name === 't3_thread_read' && args.view === 'activity'), false);
+});
+
+test('only a pending approval card on the matching live run permits an actionable reminder', async () => {
+  for (const variant of ['live', 'resolved', 'other-run', 'changed-snapshot']) {
+    const h = transport({ status: 'waiting',
+      thread: { latestRunId: 'run', activeRunId: 'run', pendingRequestCount: 1 },
+      respond: (name, args, fallback) => {
+        if (name === 't3_pending_request') return { requestIds: [] };
+        if (name !== 't3_thread_read' || !args.view) return fallback;
+        const item = { type: 'approval_request', itemId: 'approval', runId: variant === 'other-run' ? 'newer' : 'run',
+          status: variant === 'resolved' ? 'completed' : 'waiting', title: '执行测试' };
+        if (args.afterPosition === undefined) return { ...fallback, items: [], hasMore: true, nextPosition: 100 };
+        return { ...fallback, thread: { ...fallback.thread, pendingRequestCount: variant === 'changed-snapshot' ? 0 : 1 }, items: [item] };
+      } });
+    const result = await h.read();
+    assert.equal(result.approval?.id, variant === 'live' ? 'approval' : undefined, variant);
+    if (variant === 'live') assert.equal(result.approval.summary, '执行测试');
+  }
+});
+
+test('stable permission snapshots reuse verification and any server revision is checked again', async () => {
+  let revision = 'v1';
+  const h = transport({ status: 'waiting', thread: { latestRunId: 'run', activeRunId: 'run', pendingRequestCount: 1 },
+    respond: (name, args, fallback) => {
+      if (name === 't3_pending_request') return { requestIds: [] };
+      if (name !== 't3_thread_read') return fallback;
+      return { ...fallback, thread: { ...fallback.thread, updatedAt: revision }, items: args.view
+        ? [{ type: 'approval_request', itemId: revision, runId: 'run', status: 'waiting' }] : [] };
+    } });
+  const config = { threadId: 'a', approvalCache: {} };
+  for (let i = 0; i < 2; i++) assert.equal((await readTaskState(config, 'run', { control: h.control })).approval.id, 'v1');
+  assert.equal(h.tools.filter(([name, args]) => name === 't3_thread_read' && args.view).length, 1);
+  revision = 'v2';
+  assert.equal((await readTaskState(config, 'run', { control: h.control })).approval.id, 'v2');
+});
+
 test('malformed states and nonadvancing result pages terminate safely and revoke the credential', async () => {
   for (const mode of ['wrong-thread', 'no-run', 'unknown-status', 'no-timeout-flag', 'bad-page', 'bad-chunk']) {
     const h = transport({ respond: (name, args, fallback) => {

@@ -142,14 +142,40 @@ test('questions remain answerable after tracking was lost', async () => {
 
 test('desktop confirmation notices are delivered once and the same task still returns its final result', async () => {
   const h = harness();
+  let finish;
+  const resumed = new Promise(resolve => { finish = resolve; });
   const statuses = ['waiting', 'waiting', 'running', 'completed'];
   h.backend.wait = (config, runId, options) => waitForThread(config, runId, { ...options, probe: () => 'alive',
-    pause: async () => {}, read: async () => ({ threadId: config.threadId, runId, status: statuses.shift(), reply: 'final result' }) });
+    pause: async () => resumed, read: async () => ({ threadId: config.threadId, runId, status: statuses.shift(),
+      approval: { id: 'permission', summary: '执行测试' }, reply: 'final result' }) });
   h.state.jobs.push(job('one', 'needs permission'));
+  await h.tick(); await h.tick();
+  assert.equal(h.sent.filter(([, text]) => text.includes('需要在 T3 处理权限确认')).length, 1);
+  finish();
   for (let i = 0; i < 4; i++) await h.tick();
-  assert.equal(h.sent.filter(([, text]) => text.includes('正等待桌面端确认')).length, 1);
+  assert.equal(h.sent.filter(([, text]) => text.includes('需要在 T3 处理权限确认')).length, 1);
   assert.equal(h.sent.filter(([, text]) => text.includes('final result')).length, 1);
   assert.equal(h.mutations.length, 1);
+});
+
+test('waiting submission receipts without questions keep tracking rather than ending with an instruction to open T3', async () => {
+  const h = harness();
+  h.backend.send = async () => ({ threadId: 'a', runId: 'run-a', status: 'waiting', request: null });
+  h.state.jobs.push(job('one', 'task'));
+  await h.tick(); await h.tick();
+  assert.equal(h.sent.length, 1);
+  assert.match(h.sent[0][1], /result-a/);
+});
+
+test('status explains unknown waiting, verified permissions and reconnection for the selected task', async () => {
+  const h = harness();
+  const item = { ...job('one', 'work'), threadId: 'a', status: 'running' };
+  h.state.jobs.push(item);
+  for (const [status, message] of [['waiting', /原因正在核实/], ['waiting_permission', /需要在 T3 处理权限确认/],
+    ['reconnecting', /正在重连/]]) {
+    item.trackingStatus = status;
+    assert.match(await h.execute('/status'), message);
+  }
 });
 
 test('resumable task recovery has one status owner and does not leave a second typing observer behind', () => {

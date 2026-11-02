@@ -103,6 +103,7 @@ export function createScheduler({ state, config, reference, backend, save, send,
           continue;
         }
         job.projectId ||= state.routing.projectId;
+        job.acceptedAt ??= now();
         job.bound = true;
         rememberInbound(state, job);
         save();
@@ -151,8 +152,21 @@ export function createScheduler({ state, config, reference, backend, save, send,
     }
     // Reply failures only delay that job; other replies and tasks keep moving.
     for (const job of state.jobs) {
+      if (job.command.kind === 'task' && ['pending', 'running'].includes(job.status) && job.acceptedAt !== undefined
+        && now() - job.acceptedAt >= 5000 && !job.receiptChunks && !job.noticeChunks?.length
+        && (!job.trackingStatus || job.trackingStatus === 'running')) {
+        job.delayedReceipt = true;
+        job.receiptChunks = splitThreadReply(`已收到，正在${job.status === 'pending' ? '排队' : '处理'}；完成后会返回结果，无需重复发送。`,
+          job.replyThread, 1600, job.replyTo);
+        job.receiptSent = 0;
+        save();
+      }
       const noticePending = (job.receiptSent || 0) < (job.receiptChunks?.length || 0)
         || (job.noticeSent || 0) < (job.noticeChunks?.length || 0);
+      if (job.progressRetry && job.status === 'reply') {
+        delete job.progressRetry;
+        job.retryAt = 0;
+      }
       if ((job.status !== 'reply' && !noticePending) || sending.has(job.id) || (job.retryAt || 0) > now()) continue;
       if (!noticePending && state.jobs.some(earlier => earlier !== job && state.jobs.indexOf(earlier) < state.jobs.indexOf(job)
         && !earlier.replyFailed && earlier.bound && job.bound && earlier.threadId === job.threadId)) continue;
@@ -165,8 +179,30 @@ export function createScheduler({ state, config, reference, backend, save, send,
         ]) {
           while ((job[sentKey] || 0) < (job[chunksKey]?.length || 0)) {
             const index = job[sentKey] || 0;
+            // Keep persisted message IDs stable while dropping obsolete progress.
+            if (chunksKey === 'receiptChunks' && job.delayedReceipt && job.status === 'reply'
+              || chunksKey === 'noticeChunks' && job.noticeKinds?.[index]
+                && (job.status === 'reply' || job.trackingStatus !== job.noticeKinds[index])) {
+              const key = job.noticeKeys?.[index];
+              if (key && !job.sentTrackingNotices?.includes(key)) {
+                job.trackingNotices = job.trackingNotices.filter(value => value !== key);
+              }
+              job[sentKey] = index + 1;
+              save();
+              continue;
+            }
             try { await send(job, job[chunksKey][index], `${prefix}_${index}`); }
-            catch (error) { job.replyFailed = true; job.retryAt = now() + 10000; save(); status({ lastError: error.message }); return; }
+            catch (error) {
+              job.progressRetry = chunksKey === 'receiptChunks' && job.delayedReceipt
+                || chunksKey === 'noticeChunks' && !!job.noticeKinds?.[index];
+              job.replyFailed = true; job.retryAt = now() + 10000;
+              save(); status({ lastError: error.message }); return;
+            }
+            const key = chunksKey === 'noticeChunks' && job.noticeKeys?.[index];
+            if (key && !job.sentTrackingNotices?.includes(key)) {
+              job.sentTrackingNotices ||= [];
+              job.sentTrackingNotices.push(key);
+            }
             job[sentKey] = index + 1;
             save();
           }

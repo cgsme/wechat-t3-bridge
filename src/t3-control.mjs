@@ -162,6 +162,35 @@ export function readModelConfig(config) {
   return withT3Control(config, call => call('t3_thread_configure', { threadId: config.threadId }));
 }
 
+// Only a live approval card for this run is evidence of required desktop action.
+// Cache against the server revision so a stable wait does not reread its history.
+async function pendingApproval(call, config, runId, thread) {
+  const cache = config.approvalCache;
+  if (thread.updatedAt && cache?.runId === runId && cache.updatedAt === thread.updatedAt) return cache.approval;
+  let afterPosition, approval;
+  for (;;) {
+    const page = await call('t3_thread_read', { threadId: config.threadId, view: 'activity', limit: 100,
+      runLimit: 1, maxCharsPerItem: 1, ...(afterPosition === undefined ? {} : { afterPosition }) });
+    if (page.thread?.threadId !== config.threadId || !Array.isArray(page.items) || typeof page.hasMore !== 'boolean') {
+      throw trackingError('T3_INVALID_TASK', 'T3 等待状态校验失败，请在桌面端核对；不会自动重跑。');
+    }
+    const item = page.items.find(item => item.runId === runId && item.type === 'approval_request'
+      && ['pending', 'waiting'].includes(item.status));
+    if (item?.itemId) approval = { id: item.itemId, summary: item.title?.replace(/[\r\n]+/g, ' ').slice(0, 160) };
+    // Ignore cards if their snapshot no longer agrees with the live task.
+    if ((page.thread.activeRunId || page.thread.latestRunId) !== runId || !page.thread.pendingRequestCount
+      || thread.updatedAt && page.thread.updatedAt !== thread.updatedAt) return undefined;
+    if (approval || !page.hasMore) break;
+    if (!Number.isSafeInteger(page.nextPosition) || page.nextPosition < 0
+      || afterPosition !== undefined && page.nextPosition <= afterPosition) {
+      throw trackingError('T3_INVALID_TASK', 'T3 等待状态分页无效，请在桌面端核对。');
+    }
+    afterPosition = page.nextPosition;
+  }
+  if (cache && thread.updatedAt) Object.assign(cache, { runId, updatedAt: thread.updatedAt, approval });
+  return approval;
+}
+
 // T3's exact-run wait follows restart continuations and does not confuse a
 // desktop client's newer turn with this task, including while this task queues.
 export async function readTaskState(config, runId, { control = withT3Control } = {}) {
@@ -183,7 +212,9 @@ export async function readTaskState(config, runId, { control = withT3Control } =
     const current = (thread.activeRunId || thread.latestRunId) === result.runId;
     if (current && (waited.status === 'waiting' || waited.timedOut && thread.pendingRequestCount > 0)) {
       const request = await readPendingRequest(config, { control: (_, action) => action(call) });
-      return { ...result, status: 'waiting', request };
+      if (request) return { ...result, status: 'waiting', request };
+      const approval = thread.pendingRequestCount > 0 ? await pendingApproval(call, config, result.runId, thread) : undefined;
+      return { ...result, status: 'waiting', request: null, ...(approval ? { approval } : {}) };
     }
     if (waited.status === 'waiting') return { ...result, request: null };
     if (waited.timedOut) return { ...result, status: 'running' };

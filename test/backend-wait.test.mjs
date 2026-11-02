@@ -172,7 +172,8 @@ test('a stalled short CLI request still times out as a connection issue', async 
 test('desktop permission confirmation notifies once then continues to the final result', async () => {
   const statuses = ['waiting', 'waiting', 'running', 'completed'], progress = [];
   const result = await waitForThread({ threadId: 'a' }, 'run', {
-    probe: () => 'alive', read: async () => ({ threadId: 'a', runId: 'run', status: statuses.shift(), reply: 'finished' }),
+    probe: () => 'alive', read: async () => ({ threadId: 'a', runId: 'run', status: statuses.shift(),
+      approval: { id: 'permission' }, reply: 'finished' }),
     pause: async () => {}, onProgress: status => progress.push(status),
   });
   assert.equal(result, 'finished');

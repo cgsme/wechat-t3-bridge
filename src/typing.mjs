@@ -39,7 +39,7 @@ export function createTypingIndicator({ state, config, backend, api, owner,
 
   const wanted = () => !stopped && (state.typingTasks?.length > 0 || state.jobs.some(job =>
     ['pending', 'running'].includes(job.status) && TASKS.has(job.command?.kind)
-    && !['waiting_permission', 'reconnecting'].includes(job.trackingStatus)));
+    && !['waiting', 'waiting_permission', 'reconnecting'].includes(job.trackingStatus)));
   const context = () => state.typingContext || state.jobs.findLast(job => job.context)?.context;
 
   function refresh() {

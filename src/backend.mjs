@@ -133,8 +133,12 @@ export async function waitForThread(config, runId, {
   onRun = () => {}, onProgress = () => {}, structured = false, signal = config.signal,
 } = {}) {
   if (!runId) throw trackingError('T3_INVALID_TASK', '任务编号缺失，无法安全跟踪；不会重新提交任务。');
-  let retryDelay = 5000, disconnectedAt, progress;
-  const report = status => { if (status !== progress) { progress = status; onProgress(status); } };
+  let retryDelay = 5000, disconnectedAt, waitingAt, progress;
+  const approvalCache = {};
+  const report = (status, detail = {}) => {
+    const key = `${status}:${detail.approval?.id || ''}:${!!detail.notify}`;
+    if (key !== progress) { progress = key; onProgress(status, detail); }
+  };
   for (;;) {
     if (signal?.aborted) throw abortedWait();
     if (probe() === 'exited') throw trackingError('T3_SERVER_EXITED', 'T3 进程已退出，已停止等待；原任务状态未确认，不会自动重跑。请重新打开 T3 后查看 /status 或 /history。');
@@ -144,12 +148,13 @@ export async function waitForThread(config, runId, {
         throw trackingError('T3_TRACKING_LOST', '与 T3 持续失联超过 2 分钟，已停止等待；原任务状态未确认，不会自动重跑。请恢复连接后查看 /status 或 /history。');
       }
       const trackingTimeoutMs = disconnectedAt === undefined ? 45000 : Math.max(1, Math.min(45000, 120000 - (now() - disconnectedAt)));
-      data = await read({ ...config, signal, trackingTimeoutMs }, runId);
+      data = await read({ ...config, signal, trackingTimeoutMs, approvalCache }, runId);
     } catch (error) {
       if (signal?.aborted) throw abortedWait();
       if (probe() === 'exited') throw trackingError('T3_SERVER_EXITED', 'T3 进程已退出，已停止等待；原任务状态未确认，不会自动重跑。请重新打开 T3 后查看 /status 或 /history。');
       if (!['T3_COMMAND_TIMEOUT', 'T3_CONNECTION_LOST', 'T3_CLI_FAILED'].includes(error.code)) throw error;
-      if (disconnectedAt === undefined) { disconnectedAt = now(); report('reconnecting'); }
+      if (disconnectedAt === undefined) { disconnectedAt = now(); waitingAt = undefined; }
+      report('reconnecting', { notify: now() - disconnectedAt >= 10000 });
       const remaining = 120000 - (now() - disconnectedAt);
       if (remaining <= 0) throw trackingError('T3_TRACKING_LOST', '与 T3 持续失联超过 2 分钟，已停止等待；原任务状态未确认，不会自动重跑。请恢复连接后查看 /status 或 /history。');
       await pause(Math.min(retryDelay, remaining), signal);
@@ -162,10 +167,13 @@ export async function waitForThread(config, runId, {
       !activeTaskStatuses.has(data.status) && !endedTaskStatuses.has(data.status) && data.status !== 'waiting') {
       throw trackingError('T3_INVALID_TASK', 'T3 任务状态校验失败，已停止跟踪；请在 T3 核对原任务，不会自动重跑。');
     }
-    if (data.runId !== runId) { runId = data.runId; onRun(runId); }
+    if (data.runId !== runId) { runId = data.runId; waitingAt = undefined; onRun(runId); }
     if (data.status === 'waiting') {
       if (data.request) return data;
-      report('waiting_permission');
+      waitingAt ??= now();
+      report(data.approval ? 'waiting_permission' : 'waiting', {
+        approval: data.approval, notify: !!data.approval || now() - waitingAt >= 30000,
+      });
       await pause(3000, signal);
       continue;
     }
@@ -174,6 +182,7 @@ export async function waitForThread(config, runId, {
         : `任务状态：${data.status}。${data.error ? '\n' + data.error : '\n请在 T3 查看详情。'}`;
       return structured ? { ...data, reply } : reply;
     }
+    waitingAt = undefined;
     report('running');
     await pause(3000, signal);
   }

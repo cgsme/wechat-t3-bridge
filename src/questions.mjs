@@ -14,7 +14,7 @@ export function rememberQuestion(state, thread, result, save, originalQuestion) 
   if (!request) {
     delete state.pendingInputs[thread.threadId];
     save();
-    return 'T3 正等待确认，请在桌面端处理权限确认。补充问题可用 /questions 查看。';
+    return '暂未读到可在微信回答的问题，等待原因尚未确认。可用 /status 查看状态，或稍后用 /questions 重新查询。';
   }
   const previous = state.pendingInputs[thread.threadId];
   const answers = previous?.requestId === request.requestId ? { ...previous.answers } : {};
@@ -45,6 +45,7 @@ export function formatQuestion(thread, draft, state = {}) {
     question.question, '', ...(options.length ? [question.multiSelect ? '【选项 · 多选】' : '【选项 · 单选】',
       ...options.map((option, i) => `${emojiNumber(i + 1)} ${option.label}${option.description ? `\n   ${option.description}` : ''}`), ''] : []),
     '【如何回答】',
+    '引用本条消息，直接回复选项编号或补充内容即可，无需切换线程。',
     ...(otherProject ? [`先选择所属项目：/project ${thread.projectId}`] : []),
     `定向回答：/to ${selector} /answer ${example}`,
     `定向查看：/to ${selector} /questions`,

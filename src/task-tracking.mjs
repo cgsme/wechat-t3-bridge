@@ -36,17 +36,24 @@ export function taskPause(ms, signal) {
 export function trackingOptions(job, save) {
   return {
     onRun: runId => { job.runId = runId; save(); },
-    onProgress: status => {
-      if (job.trackingStatus === status) return;
-      const previous = job.trackingStatus;
+    onProgress: (status, { approval, notify = false } = {}) => {
       job.trackingStatus = status;
-      const text = status === 'waiting_permission' ? 'T3 正等待桌面端确认，请在 T3 处理；确认后桥接会继续跟踪并返回结果。'
-        : status === 'reconnecting' ? '与 T3 的连接暂时中断，正在重连；原任务未重新提交。'
-          : status === 'running' && previous === 'reconnecting' ? '已恢复 T3 连接，继续跟踪原任务。'
-            : status === 'running' && previous === 'waiting_permission' ? 'T3 已继续执行，完成后会返回结果。' : null;
-      if (text) {
+      const key = status === 'waiting_permission' && approval?.id ? `approval:${approval.id}` : status;
+      const text = status === 'waiting_permission' && approval?.id
+        ? `需要在 T3 处理权限确认${approval.summary ? `：${approval.summary}` : '。'}\n处理后会自动继续，结果将发回微信，无需重复发送任务。`
+        : status === 'waiting' ? '任务暂时处于等待状态，正在核实原因；桥接会继续跟踪，暂无需操作或重复发送任务。'
+          : status === 'reconnecting' ? '与 T3 的连接暂时中断，正在重连；原任务未重新提交，暂无需重复发送。' : null;
+      if (notify && text && !job.trackingNotices?.includes(key)) {
+        job.trackingNotices ||= [];
+        job.trackingNotices.push(key);
         job.noticeChunks ||= [];
-        job.noticeChunks.push(...splitThreadReply(text, job.replyThread, 1600, job.replyTo || job.command?.text));
+        job.noticeKinds ||= {};
+        job.noticeKeys ||= {};
+        for (const chunk of splitThreadReply(text, job.replyThread, 1600, job.replyTo || job.command?.text)) {
+          job.noticeKinds[job.noticeChunks.length] = status;
+          job.noticeKeys[job.noticeChunks.length] = key;
+          job.noticeChunks.push(chunk);
+        }
       }
       save();
     },

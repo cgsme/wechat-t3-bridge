@@ -276,7 +276,14 @@ export async function executeCommand({ command, state, config, reference, backen
         if (current.threadId !== selected.threadId) throw new Error('Fast thread mismatch');
         fast = fastLabel(current.fast);
       } catch {}
-      return `${threadLabel(selected)}\n\n【连接状态】\n🟢 微信已连接\n项目：${projectLabel(routing, selected.projectId)}\n${command.selector ? '目标' : '当前'}线程：${statusLabel(selected.status)}\nFast：${fast}\n\n【桥接任务】\n执行中：${state.jobs.filter(item => item !== job && item.status === 'running').length} 个任务\n排队中：${state.jobs.filter(item => item.status === 'pending').length} 条消息\n\n【快捷操作】\n/threads  查看线程\n${control} on|off  切换 Fast\n/new <要求>  新建任务线程`;
+      const tracked = state.jobs.find(item => item !== job && item.threadId === selected.threadId
+        && ['pending', 'running'].includes(item.status) && ['task', 'new', 'answer'].includes(item.command?.kind));
+      const tracking = state.pendingInputs?.[selected.threadId] ? '等待微信回答，可引用问题消息回复'
+        : state.untrackedRuns?.[selected.threadId] ? '已停止跟踪，请核对原任务结果'
+          : tracked ? ({ waiting: '等待中，原因正在核实，暂无需操作', waiting_permission: '需要在 T3 处理权限确认，之后自动继续',
+            reconnecting: '正在重连，原任务未重新提交' }[tracked.trackingStatus]
+            || (tracked.status === 'pending' ? '微信任务排队中' : '正在处理微信任务，完成后自动返回结果')) : null;
+      return `${threadLabel(selected)}\n\n【连接状态】\n🟢 微信已连接\n项目：${projectLabel(routing, selected.projectId)}\n${command.selector ? '目标' : '当前'}线程：${statusLabel(selected.status)}\nFast：${fast}${tracking ? `\n任务跟踪：${tracking}` : ''}\n\n【桥接任务】\n执行中：${state.jobs.filter(item => item !== job && item.status === 'running').length} 个任务\n排队中：${state.jobs.filter(item => item.status === 'pending').length} 条消息\n\n【快捷操作】\n/threads  查看线程\n${control} on|off  切换 Fast\n/new <要求>  新建任务线程`;
     }
     case 'new': {
       // /new is the only path that creates a thread. A restart never reruns it.
@@ -366,7 +373,7 @@ export async function executeCommand({ command, state, config, reference, backen
       if (backend.pending && (selected.pendingRequestCount > 0 || selected.status === 'waiting')) {
         const request = await backend.pending(target);
         if (request) return rememberQuestion(state, selected, { request, runId: selected.latestRunId }, save);
-        return 'T3 正等待确认，请在桌面端查看；本条消息未作为新任务发送。';
+        return '当前线程处于等待状态，原因尚未确认；本条消息未作为新任务发送。请用 /questions 查看是否有待答问题，或用 /status 查看状态。';
       }
       let result;
       const prompt = skillPrompt(command, config);
@@ -380,7 +387,7 @@ export async function executeCommand({ command, state, config, reference, backen
         throw error;
       }
       if (result?.runId) { job.runId = result.runId; save(); }
-      if (activeTaskStatuses.has(result?.status)) {
+      if (activeTaskStatuses.has(result?.status) || result?.status === 'waiting' && !result.request) {
         if (!result.runId) throw new Error('T3 未返回任务编号，请在桌面端核对；不会自动重跑。');
         job.waitOnly = true;
         save();

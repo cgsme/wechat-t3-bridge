@@ -38,6 +38,19 @@ function harness() {
     polls: () => polls, tick: async () => { indicator.tick(); await flush(); } };
 }
 
+test('waiting and reconnecting pause typing while another live WeChat task can keep it active', async () => {
+  const h = harness();
+  const job = { command: { kind: 'task' }, status: 'running', trackingStatus: 'running' };
+  h.state.jobs.push(job); await h.tick();
+  for (const trackingStatus of ['waiting', 'waiting_permission', 'reconnecting']) {
+    job.trackingStatus = trackingStatus;
+    await h.tick(); assert.equal(h.sends.at(-1).active, false);
+    const other = { command: { kind: 'task' }, status: 'running' };
+    h.state.jobs.push(other); await h.tick(); assert.equal(h.sends.at(-1).active, true);
+    h.state.jobs.pop(); await h.tick(); assert.equal(h.sends.at(-1).active, false);
+  }
+});
+
 test('typing uses authenticated owner config and wire statuses, allowing an empty sendtyping response', async () => {
   const calls = [];
   const api = new WechatApi({ token: 'private', fetchImpl: async (url, options) => {
